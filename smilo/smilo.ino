@@ -11,7 +11,7 @@
  * support.
  *
  * SMILO is currently built on top of an OLIMEX ESP32-EVB which contains
- * all the components one needs: LAN-port, 2x relais, uart to connect
+ * all the components one needs: LAN-port, 2x relais, UART to connect
  * pins to the serial port of the host board.
  *
  * This program is based on examples:
@@ -148,7 +148,7 @@
 /* how many clients can be connected at the same time to the console */
 #define MAX_SRV_CLIENTS 8
 
-void clients_console_write_bytes(char * s, size_t len);
+void clients_console_write_bytes(char * s, size_t len, int id);
 /* }}} */
 
 /* {{{ global state */
@@ -188,7 +188,7 @@ typedef enum eeprom_var {
   VAR_USERNAME,
   VAR_PASSWORD
 #define VAR_FIRST VAR_HOSTNAME
-#define VAR_LAST  VAR_CYCLEMS
+#define VAR_LAST  VAR_PASSWORD
 } eeprom_var;
 
 typedef enum eeprom_type {
@@ -198,14 +198,15 @@ typedef enum eeprom_type {
 
 static struct {
   eeprom_var      var;
+  char           *varname;
   eeprom_vartype  type;
   void           *defval;
 } eeprom_typemap[] = {
-  { (eeprom_var)0, (eeprom_vartype)0, NULL }, /* unset, slot 0 */
-  { VAR_HOSTNAME,    VARTPE_STR,   (void *)"smilo" },
-  { VAR_CYCLEMS,     VARTPE_INT,   (void *)200     },
-  { VAR_USERNAME,    VARTPE_STR,   (void *)"ADMIN" },
-  { VAR_PASSWORD,    VARTPE_STR,   (void *)"ADMIN" }
+  { (eeprom_var)0, NULL, (eeprom_vartype)0, NULL }, /* unset, slot 0 */
+  { VAR_HOSTNAME, "hostname",   VARTPE_STR,   (void *)"smilo" },
+  { VAR_CYCLEMS,  "cyclems",    VARTPE_INT,   (void *)200     },
+  { VAR_USERNAME, "username",   VARTPE_STR,   (void *)"ADMIN" },
+  { VAR_PASSWORD, "password",   VARTPE_STR,   (void *)"ADMIN" }
 };
 
 void
@@ -404,6 +405,8 @@ eeprom_set_var(eeprom_var var, void *val)
 WebServer  http(80);
 
 bool http_handle_auth() {
+  /* cache this statically, because HTTP request will look this up over
+   * and over again */
   static char *user = (char *)eeprom_get_var(VAR_USERNAME);
   static char *pass = (char *)eeprom_get_var(VAR_PASSWORD);
 
@@ -431,7 +434,7 @@ void http_handle_trigger_power() {
                     "[request to press power button from %s:%u]\n",
                     http.client().remoteIP().toString().c_str(),
                     http.client().remotePort());
-  clients_console_write_bytes(msg, msgsiz);
+  clients_console_write_bytes(msg, msgsiz, -1);
   clients_history_write_bytes(msg, msgsiz);
 
   digitalWrite(POWER_PIN, HIGH);
@@ -450,7 +453,7 @@ void http_handle_hold_power_5s() {
                     "[request to hold power button 5s from %s:%u]\n",
                     http.client().remoteIP().toString().c_str(),
                     http.client().remotePort());
-  clients_console_write_bytes(msg, msgsiz);
+  clients_console_write_bytes(msg, msgsiz, -1);
   clients_history_write_bytes(msg, msgsiz);
 
   digitalWrite(POWER_PIN, HIGH);
@@ -469,7 +472,7 @@ void http_handle_trigger_reset() {
                     "[request to press reset button from %s:%u]\n",
                     http.client().remoteIP().toString().c_str(),
                     http.client().remotePort());
-  clients_console_write_bytes(msg, msgsiz);
+  clients_console_write_bytes(msg, msgsiz, -1);
   clients_history_write_bytes(msg, msgsiz);
 
   digitalWrite(RESET_PIN, HIGH);
@@ -489,7 +492,7 @@ void http_handle_config_reset() {
                     "expect connection loss]\n",
                     http.client().remoteIP().toString().c_str(),
                     http.client().remotePort());
-  clients_console_write_bytes(msg, msgsiz);
+  clients_console_write_bytes(msg, msgsiz, -1);
   clients_history_write_bytes(msg, msgsiz);
 
   http.send(200, "text/plain",
@@ -539,6 +542,46 @@ void http_handle_root() {
 /* }}} */
 
 /* {{{ Telnet client */
+typedef enum client_auth_state {
+  SCSA_INIT = 0,
+  SCSA_SEND_USER,
+  SCSA_RECV_USER,
+  SCSA_SEND_PASS,
+  SCSA_RECV_PASS,
+  SCSA_CHECK_CRED
+} client_auth_state;
+
+struct scs_auth {
+#define SCSA_BUFMAXLEN 20
+  char      username[SCSA_BUFMAXLEN];
+  int       usernamelen;
+  char      password[SCSA_BUFMAXLEN];
+  int       passwordlen;
+}           auth;
+
+typedef enum client_menu_state {
+  SCSM_INIT = 0,
+  SCSM_SEND_MAIN,
+  SCSM_RECV_MAIN,
+  SCSM_SEND_PROP,
+  SCSM_SEND_RESET,
+  SCSM_SEND_POWER,
+  SCSM_SEND_POWER5S
+} client_menu_state;
+
+struct scs_menu {
+  void *dummy;
+};
+
+typedef enum client_sol_state {
+  SCSS_INIT = 0,
+  SCSS_SOL,
+} client_sol_state;
+
+struct scs_sol {
+  void *dummy;
+};
+
 typedef enum client_state {
   SCS_FREE = 0,
   SCS_AUTH,
@@ -550,21 +593,57 @@ typedef struct client {
   WiFiClient    connection;
   unsigned long connect_at;
   client_state  state;
+  int           seq;
+  unsigned char echo_replied:1;
+  unsigned char localecho_replied:1;
+  union {
+    struct scs_auth
+                auth;
+    struct scs_menu
+                menu;
+    struct scs_sol
+                sol;
+  }             statectx;
 } client;
 
 client clients[MAX_SRV_CLIENTS];
 
-WiFiServer server(23);
+WiFiServer telnet(23);
 
 /* console clients, these are connected via a TCP socket */
-void clients_console_write_bytes(char *s, size_t len)
+void clients_console_write_bytes(char *s, size_t len, int id)
 {
   int i;
+  size_t startb;
+  size_t endb;
 
-  for (i = 0; i < MAX_SRV_CLIENTS; i++) {
-    if (clients[i].state == SCS_SOL &&
-        clients[i].connection.connected())
-      clients[i].connection.write((uint8_t *)s, len);
+  for (startb = 0, endb = 0; endb < len; endb++) {
+    if (s[endb] == '\n' || s[endb] == '\b' || endb == (len - 1)) {
+      for (i = 0; i < MAX_SRV_CLIENTS; i++) {
+        if ((id == i ||
+             (id < 0 &&
+              clients[i].state == SCS_SOL &&
+              (client_sol_state)(clients[i].seq) == SCSS_SOL)) &&
+            clients[i].connection.connected())
+        {
+          if (s[endb] == '\n') {
+            clients[i].connection.write((uint8_t *)(&s[startb]),
+                                        endb - startb);
+            clients[i].connection.write("\r\n");
+          } else if (s[endb] == '\b') {
+            clients[i].connection.write((uint8_t *)(&s[startb]),
+                                        endb - startb);
+            clients[i].connection.write('\b');  /* BS */
+            clients[i].connection.write(' ');   /* SP */
+            clients[i].connection.write('\b');  /* BS */
+          } else {
+            clients[i].connection.write((uint8_t *)(&s[startb]),
+                                        endb + 1 - startb);
+          }
+        }
+      }
+      startb = endb + 1;
+    }
   }
 }
 
@@ -587,6 +666,380 @@ void clients_history_write_bytes(char *s, size_t len)
     if (histbuflen < histbufpos)
       histbuflen = histbufpos;
   } while (len > 0);
+}
+
+static uint8_t telnet_read(int id)
+{
+  client *cl = &clients[id];
+
+  if (cl->connection.available()) {
+    uint8_t chr = cl->connection.read();
+    if (chr == 0xff) { /* telnet command */
+      chr = cl->connection.read();
+      switch (chr) {
+        case 241: /* NOP */
+          /* ignore */
+          chr = 0;
+          break;
+        case 243: /* Break */
+          chr = 0;
+          break;
+        case 246: /* AYT */
+          /* are you there, just answer the question */
+          cl->connection.write("Yes!\r\n");
+          chr = 0;
+          break;
+        case 247: /* Erase-Character */
+          chr = '\b';
+          Serial.printf("received EC\n");
+          break;
+        case 251: /* WILL */
+        case 252: /* WONT */
+        case 253: /* DO */
+        case 254: /* DONT */
+          {
+#define mustdo(I) (I == 251 ? 253 : I == 252 ? 253 : I == 253 ? 251 : 251)
+#define refuse(I) (I == 251 ? 254 : I == 252 ? 254 : I == 253 ? 252 : 252)
+#define opttostr(X) (X == 251 ? "WILL" : X == 252 ? "WON'T" : \
+                     X == 253 ? "DO" : "DON'T")
+            uint8_t option = cl->connection.read();
+            Serial.printf("received %s %u\n", opttostr(chr), option);
+            switch (option) {
+              case 1: /* ECHO */
+              case 3: /* SUPPRESS-GO-AHEAD */
+              case 45: /* SUPPRESS-LOCAL-ECHO */
+                if (option == 1) {
+                  if (cl->echo_replied)
+                    break;
+                  cl->echo_replied = true;
+                }
+                if (option == 45) {
+                  if (cl->localecho_replied)
+                    break;
+                  cl->localecho_replied = true;
+                }
+                cl->connection.write(0xff);
+                cl->connection.write(mustdo(chr));
+                cl->connection.write(option);
+                Serial.printf("sent %s %u\n", opttostr(mustdo(chr)), option);
+                break;
+              case 24: /* TERMINAL-TYPE */
+              case 31: /* WINDOW-SIZE */
+              case 33: /* FLOW-CONTROL */
+              case 34: /* LINEMODE */
+              default:
+                cl->connection.write(0xff);
+                cl->connection.write(refuse(chr));
+                cl->connection.write(option);
+                Serial.printf("sent %s %u\n", opttostr(refuse(chr)), option);
+                break;
+            }
+            chr = 0;
+            break;
+          }
+        case 255: /* IAC */
+          /* forward to client */
+          break;
+        default:
+          Serial.printf("received unknown command: %u\n", chr);
+          break;
+      }
+    }
+#ifdef debug
+    if (chr < 32 || chr >= 127)
+      Serial.printf("received control char %u\n", chr);
+#endif
+    /* map DEL into BS */
+    if (chr == 127)
+      chr = '\b';
+    /* map \r<NUL> or \r\n into \n */
+    if (chr == '\r')
+    {
+      if ((chr = cl->connection.read()) == 0)
+        chr = '\n';
+    }
+
+    return chr;
+  }
+
+  return 0;
+}
+
+void clients_handle_state(int id)
+{
+  client *cl = &clients[id];
+
+  switch (cl->state) {
+    case SCS_AUTH:
+      {
+        struct scs_auth *ctx = &cl->statectx.auth;
+        client_auth_state seq = (client_auth_state)cl->seq;
+        switch (seq) {
+          case SCSA_INIT:
+            memset(ctx, 0, sizeof(*ctx));
+            seq = SCSA_SEND_USER;
+            /* request echo to be OFF */
+            cl->connection.write(0xff);
+            cl->connection.write(251);   /* WILL */
+            cl->connection.write(1);     /* ECHO */
+            Serial.printf("sent WILL 1 (ECHO)\n");
+
+            /* linemode basically is in the way of echo, so disable */
+            cl->connection.write(0xff);
+            cl->connection.write(254);   /* DONT */
+            cl->connection.write(34);    /* LINEMODE */
+            Serial.printf("sent DONT 34 (LINEMODE)\n");
+
+            /* this is newer, let's request it in any case */
+            cl->connection.write(0xff);
+            cl->connection.write(253);   /* DO */
+            cl->connection.write(45);    /* SUPPRESS-LOCAL-ECHO */
+            Serial.printf("sent DO 45 (SUPPRESS-LOCAL-ECHO)\n");
+            break;
+          case SCSA_SEND_USER:
+            cl->connection.write((uint8_t *)"username: ", 10);
+            seq = SCSA_RECV_USER;
+            break;
+          case SCSA_SEND_PASS:
+            cl->connection.write((uint8_t *)"password: ", 10);
+            seq = SCSA_RECV_PASS;
+            break;
+          case SCSA_RECV_USER:
+          case SCSA_RECV_PASS:
+            {
+              uint8_t chr;
+              char *buf;
+              int *buflen;
+
+              if (seq == SCSA_RECV_USER) {
+                buf = ctx->username;
+                buflen = &ctx->usernamelen;
+              } else if (seq == SCSA_RECV_PASS) {
+                buf = ctx->password;
+                buflen = &ctx->passwordlen;
+              }
+
+              while ((chr = telnet_read(id)) != 0) {
+                if (chr == '\n') {
+                  /* hooray, end of string */
+                  clients_console_write_bytes((char *)&chr, 1, id);
+                  if (seq == SCSA_RECV_USER)
+                    seq = SCSA_SEND_PASS;
+                  else if (seq == SCSA_RECV_PASS)
+                    seq = SCSA_CHECK_CRED;
+                  break;
+                } else if (chr == '\b') {
+                  /* remove from buf, if not at start already */
+                  if (*buflen > 0)
+                    (*buflen)--;
+                  else
+                    continue;  /* don't echo it back */
+                } else {
+                  /* append char if it fits */
+                  if (*buflen < SCSA_BUFMAXLEN) {
+                    buf[*buflen] = (char)chr;
+                    (*buflen)++;
+                  }
+                }
+                /* echo it back to the client */
+                if (seq == SCSA_RECV_USER)
+                  clients_console_write_bytes((char *)&chr, 1, id);
+              }
+            }
+            break;
+          case SCSA_CHECK_CRED:
+            {
+              char *user = (char *)eeprom_get_var(VAR_USERNAME);
+              int userlen = (int)strlen(user);
+              char *pass = (char *)eeprom_get_var(VAR_PASSWORD);
+              int passlen = (int)strlen(pass);
+
+              if (userlen != ctx->usernamelen ||
+                  passlen != ctx->passwordlen ||
+                  memcmp(user, ctx->username, userlen) != 0 ||
+                  memcmp(pass, ctx->password, passlen) != 0)
+              {
+                cl->connection.printf("Authentication failure.\r\n\r\n");
+                seq = SCSA_SEND_USER;
+              }
+              else
+              {
+                /* login succeeded, advance to the next stage */
+                cl->state = SCS_MENU;
+                seq = SCSA_INIT;
+              }
+              /* for security, wipe whatever we have */
+              memset(ctx, 0, sizeof(*ctx));
+            }
+            break;
+        }
+        cl->seq = (int)seq;
+      }
+      break;
+    case SCS_MENU:
+      {
+        struct scs_menu *ctx = &cl->statectx.menu;
+        client_menu_state seq = (client_menu_state)cl->seq;
+        switch (seq) {
+          case SCSM_INIT:
+            memset(ctx, 0, sizeof(*ctx));
+            seq = SCSM_SEND_MAIN;
+            cl->connection.printf("SMILO\r\n");
+            break;
+          case SCSM_SEND_MAIN:
+            cl->connection.printf("\r\n"
+                                  "1. launch [s]erial console\r\n"
+                                  "2. view/edit pr[o]perties\r\n"
+                                  "3. hit [r]eset button\r\n"
+                                  "4. press [p]ower button\r\n"
+                                  "5. hold [P]ower button\r\n"
+                                  "6. [d]isconnect\r\n"
+                                  "\n"
+                                  "Please enter your choice: ");
+            seq = SCSM_RECV_MAIN;
+            break;
+          case SCSM_RECV_MAIN:
+            {
+              uint8_t chr;
+              while ((chr = telnet_read(id)) != 0) {
+                switch (chr) {
+                  case '1':
+                  case 's':
+                    cl->state = SCS_SOL;
+                    seq = SCSM_INIT;
+                    cl->connection.printf("serial\r\n\r\n");
+                    break;
+                  case '2':
+                  case 'o':
+                    seq = SCSM_SEND_PROP;
+                    cl->connection.printf("properties\r\n\n");
+                    break;
+                  case '3':
+                  case 'r':
+                    seq = SCSM_SEND_RESET;
+                    cl->connection.printf("reset host\r\n\n");
+                    break;
+                  case '4':
+                  case 'p':
+                    seq = SCSM_SEND_POWER;
+                    cl->connection.printf("power press\r\n\n");
+                    break;
+                  case '5':
+                  case 'P':
+                    seq = SCSM_SEND_POWER5S;
+                    cl->connection.printf("hold power\r\n\n");
+                    break;
+                  case '6':
+                  case 'q':
+                  case 'd':
+                    cl->connection.printf("disconnect\r\n\nBye!\r\n");
+                    cl->connection.stop();
+                    break;
+                  default:
+                    cl->connection.printf("\r\ninvalid option: '%c'\r\n", chr);
+                    seq = SCSM_SEND_MAIN;
+                    break;
+                }
+              }
+            }
+            break;
+          case SCSM_SEND_PROP:
+            {
+              int i;
+
+              cl->connection.printf("properties:\r\n"
+                                   "\n");
+              for (i = (int)VAR_FIRST; i < (int)VAR_LAST; i++) {
+                if (eeprom_typemap[i].type == VARTPE_STR) {
+                  cl->connection.printf("%2d. %-10s  %-15s  [%s]\r\n",
+                                       i, eeprom_typemap[i].varname,
+                                       eeprom_get_var((eeprom_var)i),
+                                       (char *)eeprom_typemap[i].defval);
+                } else if (eeprom_typemap[i].type == VARTPE_INT) {
+                  cl->connection.printf("%2d. %-10s  %-15d  [%d]\r\n",
+                                       i, eeprom_typemap[i].varname,
+                                       (int)eeprom_get_var((eeprom_var)i),
+                                       (int)eeprom_typemap[i].defval);
+                }
+              }
+              cl->connection.printf("%2d. %-10s  %-15s\r\n",
+                                    i, eeprom_typemap[i].varname,
+                                    "*****");
+            }
+            seq = SCSM_SEND_MAIN;
+            break;
+          case SCSM_SEND_RESET:
+          case SCSM_SEND_POWER:
+          case SCSM_SEND_POWER5S:
+            {
+              char msg[128];
+              const char *action;
+              size_t msgsiz;
+              uint8_t pin;
+
+              action =
+                seq == SCSM_SEND_RESET ? "press reset" :
+                seq == SCSM_SEND_POWER ? "press power" :
+                                         "hold power";
+
+              cl->connection.printf("%s ... ", action);
+
+              msgsiz = snprintf(msg, sizeof(msg),
+                                "[request to %s button from %s:%u]\n",
+                                action,
+                                cl->connection.remoteIP().toString().c_str(),
+                                cl->connection.remotePort());
+              clients_console_write_bytes(msg, msgsiz, -1);
+              clients_history_write_bytes(msg, msgsiz);
+
+              if (seq == SCSM_SEND_RESET)
+                pin = RESET_PIN;
+              else
+                pin = POWER_PIN;
+
+              digitalWrite(pin, HIGH);
+              if (seq == SCSM_SEND_POWER5S)
+                delay(5000);
+              else
+                delay(200);
+              digitalWrite(pin, LOW);
+
+              cl->connection.printf("done\r\n");
+
+              seq = SCSM_SEND_MAIN;
+            }
+            break;
+        }
+        cl->seq = (int)seq;
+      }
+      break;
+    case SCS_SOL:
+      {
+        struct scs_sol *ctx = &cl->statectx.sol;
+        client_sol_state seq = (client_sol_state)cl->seq;
+        switch (seq) {
+          case SCSS_INIT:
+            /* dump current history buffer */
+            clients_console_write_bytes((char *)&histbuf[histbufpos],
+                                        histbuflen - histbufpos, id);
+            clients_console_write_bytes((char *)histbuf, histbufpos, id);
+            seq = SCSS_SOL;
+            break;
+          case SCSS_SOL:
+            {
+              uint8_t chr;
+
+              /* proxy data from clients to uart, byte by byte since this most
+               * likely is what the input is (keyboard) */
+              while ((chr = telnet_read(id)) != 0)
+                Serial1.write(chr);
+            }
+            break;
+        }
+        cl->seq = (int)seq;
+      }
+      break;
+  }
 }
 /* }}} */
 
@@ -612,8 +1065,8 @@ void net_handle_event(WiFiEvent_t event) {
                     ETH.gatewayIP().toString().c_str(),
                     ETH.dnsIP().toString().c_str());
       Serial.println("Starting telnet server on port 23");
-      server.begin();
-      server.setNoDelay(true);
+      telnet.begin();
+      telnet.setNoDelay(true);
       server_ready = true;
 
       Serial.println("Starting http server on port 80");
@@ -626,14 +1079,14 @@ void net_handle_event(WiFiEvent_t event) {
       break;
     case ARDUINO_EVENT_ETH_DISCONNECTED:
       Serial.println("Ethernet link down");
-      server.stopAll();
+      telnet.stopAll();
       http.stop();
       server_ready = false;
       break;
     case ARDUINO_EVENT_ETH_STOP:
       Serial.println("Ethernet removed");
-      server.stopAll();
-      server.end();
+      telnet.stopAll();
+      telnet.end();
       http.stop();
       http.close();
       server_ready = false;
@@ -688,8 +1141,8 @@ void loop() {
     goto snooze;
 
   /* add new connections, if any */
-  if (server.hasClient()) {
-    newclient = server.accept();
+  if (telnet.hasClient()) {
+    newclient = telnet.accept();
     if (!newclient) {
       Serial.println("Failed to accept new client, ignoring");
       return;
@@ -700,6 +1153,7 @@ void loop() {
         clients[i].connection = newclient;
         clients[i].connect_at = millis();
         clients[i].state      = SCS_AUTH;
+        clients[i].seq        = 0;  /* init */
         break;
       }
     }
@@ -714,9 +1168,6 @@ void loop() {
                   clients[i].connection.remotePort());
     clients[i].connection.printf("[successfully connected to %s]\n",
                                  ETH.localIP().toString().c_str());
-    /* dump current history buffer */
-    clients[i].connection.write(&histbuf[histbufpos], histbuflen - histbufpos);
-    clients[i].connection.write(histbuf, histbufpos);
   }
 
   /* proxy data from uart to clients and/or buffer, read in blocks
@@ -732,7 +1183,7 @@ void loop() {
     if (savail > sizeof(histbuf) - histbufpos)
       savail = sizeof(histbuf) - histbufpos;
     savail = Serial1.readBytes(&histbuf[histbufpos], savail);
-    clients_console_write_bytes((char *)&histbuf[histbufpos], savail);
+    clients_console_write_bytes((char *)&histbuf[histbufpos], savail, -1);
     histbufpos += savail;
     if (histbuflen < histbufpos)
       histbuflen = histbufpos;
@@ -749,12 +1200,7 @@ void loop() {
         clients[i].connection.stop();
         clients[i].state = SCS_FREE;
       } else {
-        /* proxy data from clients to uart, byte by byte since this most
-         * likely is what the input is (keyboard) */
-        while (clients[i].connection.available()) {
-          Serial.println("writing a byte to uart");
-          Serial1.write(clients[i].connection.read());
-        }
+        clients_handle_state(i);
 
         connected_clients++;
       }
