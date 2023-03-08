@@ -618,7 +618,10 @@ void clients_console_write_bytes(char *s, size_t len, int id)
   size_t endb;
 
   for (startb = 0, endb = 0; endb < len; endb++) {
-    if (s[endb] == '\n' || s[endb] == '\b' || endb == (len - 1)) {
+    if (s[endb] == '\n' ||
+        s[endb] == 127  ||  /* DEL */
+        endb == (len - 1))
+    {
       for (i = 0; i < MAX_SRV_CLIENTS; i++) {
         if ((id == i ||
              (id < 0 &&
@@ -630,7 +633,7 @@ void clients_console_write_bytes(char *s, size_t len, int id)
             clients[i].connection.write((uint8_t *)(&s[startb]),
                                         endb - startb);
             clients[i].connection.write("\r\n");
-          } else if (s[endb] == '\b') {
+          } else if (s[endb] == 127) {  /* DEL */
             clients[i].connection.write((uint8_t *)(&s[startb]),
                                         endb - startb);
             clients[i].connection.write('\b');  /* BS */
@@ -690,7 +693,7 @@ static uint8_t telnet_read(int id)
           chr = 0;
           break;
         case 247: /* Erase-Character */
-          chr = '\b';
+          chr = 127;  /* DEL */
           Serial.printf("received EC\n");
           break;
         case 251: /* WILL */
@@ -749,9 +752,6 @@ static uint8_t telnet_read(int id)
     if (chr < 32 || chr >= 127)
       Serial.printf("received control char %u\n", chr);
 #endif
-    /* map DEL into BS */
-    if (chr == 127)
-      chr = '\b';
     /* map \r<NUL> or \r\n into \n */
     if (chr == '\r')
     {
@@ -828,7 +828,7 @@ void clients_handle_state(int id)
                   else if (seq == SCSA_RECV_PASS)
                     seq = SCSA_CHECK_CRED;
                   break;
-                } else if (chr == '\b') {
+                } else if (chr == 127) {  /* DEL */
                   /* remove from buf, if not at start already */
                   if (*buflen > 0)
                     (*buflen)--;
