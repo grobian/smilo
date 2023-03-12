@@ -615,11 +615,16 @@ typedef struct client {
   }             statectx;
 } client;
 
+/* console clients, these are connected via a TCP socket */
 client clients[MAX_SRV_CLIENTS];
 
 WiFiServer telnet(23);
 
-/* console clients, these are connected via a TCP socket */
+/* telnet is specified in a bunch of RFCs, main one:
+ * https://www.rfc-editor.org/rfc/rfc854
+ * follow-ups for features are referenced from here:
+ * https://www.iana.org/assignments/telnet-options/telnet-options.xhtml
+ */
 void clients_console_write_bytes(char *s, size_t len, int id)
 {
   int i;
