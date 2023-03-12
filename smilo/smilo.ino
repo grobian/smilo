@@ -36,12 +36,10 @@
  */
 
 /* TODO:
- * - find GPIO pin for input (34 to 39?) to connect 3.3V from mainboard
- *   to, this could be from the ATX power pin, or perhaps the power LED
- *   pin, provided it emits at most 3.3V (measure first).  Then that
- *   input (digitalRead) could be used to report the current power state
- *   of the host board.  Second thought: there is a 3.3V pin on the COM1
- *   port of the mainboard that we can likely use safely/easily.
+ * - the web-interface needs a lot of love
+ * - console output on web-interface needs processing for ANSI-escape
+ *   codes and more not to show gibberish
+ * - setting/changing properties needs to be implemented
  */
 
 /* Connections/wires to be attached to OLIMEX ESP32-EVB
@@ -59,11 +57,13 @@
  *              ...... ...RX.......   ..RX..
  *              :    : :          :   :    :
  *              :  +-----------+  :   :  +-----------+
- *              :  | 1 2 o o o |   \ /   | 3 o o o   |
+ *              :  | 1 2 o o 4 |   \ /   | 3 o o o   |
  *              :  | o 3 o o o |    X    | o 2 1 o o |
  *              :  +----   ----+   / \   +-----------+
  *              :      :..TX......:   :..TX..: :
  *              :.............GND..............:
+ *
+ *                           4 = input pin for board power (at most 5V)
  *
  *
  * The power and reset "buttons" are actual relais on on the EVB.  So
@@ -84,8 +84,10 @@
  * that "PWRLED", "PLED" or similar is something else, and you should
  * not use those here.
  *
- *          +====+ +-----+
- *          | ETH| | RST | o
+ *                                                  UEXT1 pin 4
+ *                                                  |
+ *          +====+ +-----+                          :
+ *          | ETH| | RST | o                        |
  *          |____| +-----+ o \                      o o   PWRLED
  *                 +-----+ o --===== RST ====,      o o   HDDLED   main
  *      EVB        | PWR | o                 '===== o o   RESET    board
@@ -148,6 +150,10 @@
 /* how many clients can be connected at the same time to the console */
 #define MAX_SRV_CLIENTS 8
 
+/* UART1 pins */
+#define UART1_RX_PIN 36
+#define UART1_TX_PIN  4
+
 void clients_console_write_bytes(char * s, size_t len, int id);
 /* }}} */
 
@@ -163,6 +169,9 @@ static size_t         histbuflen = 0;
 static size_t         histbufpos = 0;
 /* timer var used to timeout stale connections */
 static unsigned long  lasttick = 0;
+
+/* pin to get board power from */
+#define BOARD_PWR_PIN 17  /* SPI0:CS0, UEXT1 pin 10 */
 /* }}} */
 
 /* {{{ EEPROM */
@@ -888,6 +897,8 @@ void clients_handle_state(int id)
             break;
           case SCSM_SEND_MAIN:
             cl->connection.printf("\r\n"
+                                  "host board is powered %s\r\n"
+                                  "\r\n"
                                   "1. launch [s]erial console\r\n"
                                   "2. view/edit pr[o]perties\r\n"
                                   "3. hit [r]eset button\r\n"
@@ -895,7 +906,9 @@ void clients_handle_state(int id)
                                   "5. hold [P]ower button\r\n"
                                   "6. [d]isconnect\r\n"
                                   "\n"
-                                  "Please enter your choice: ");
+                                  "Please enter your choice: ",
+                                  digitalRead(BOARD_PWR_PIN) == HIGH ?
+                                  "on" : "off");
             seq = SCSM_RECV_MAIN;
             break;
           case SCSM_RECV_MAIN:
@@ -1119,11 +1132,13 @@ void setup() {
   			    ETH_MDIO_PIN, ETH_TYPE, ETH_CLK_MODE);
 
   Serial.println("Setting up serial connection: 115200 baud");
-  Serial1.begin(115200, SERIAL_8N1, 36, 4, true);
+  Serial1.begin(115200, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN, true);
 
   Serial.println("Setting up power and reset pins for output");
   pinMode(POWER_PIN, OUTPUT);
   pinMode(RESET_PIN, OUTPUT);
+  Serial.printf("Setting up host board power state pin for input");
+  pinMode(BOARD_PWR_PIN, INPUT_PULLDOWN);
 }
 /* }}} */
 
