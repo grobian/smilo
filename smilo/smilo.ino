@@ -39,7 +39,9 @@
  * - the web-interface needs a lot of love
  * - console output on web-interface needs processing for ANSI-escape
  *   codes and more not to show gibberish
- * - setting/changing properties needs to be implemented
+ * - the history buffer resume should probably recognise screen clears
+ *   or the alternative buffer call and reset the buffer for that
+ *   (connect can show quite some past behaviour)
  */
 
 /* Connections/wires to be attached to OLIMEX ESP32-EVB
@@ -93,6 +95,26 @@
  *      EVB        | PWR | o                 '===== o o   RESET    board
  *                 +-----+ o --===== PWR ========== o o   PWRBTN
  *                         o /                      o
+ *
+ * 
+ * Usage
+ * =====
+ *
+ * Once flashed, SMILO boots and waits for a connection either via
+ * telnet (port 23) or http (port 80).  The default credentials are
+ * ADMIN/ADMIN, and can be changed via the properties menu.  To reset to
+ * the default settings, press and hold BUT1 on the EVB until it resets
+ * itself.
+ *
+ * Telnet
+ * ------
+ * 
+ * Connections via telnet better be via a telnet client, e.g. not nc.
+ * SMILO understands a limited part of the telnet protocol, but enough
+ * to handle backspaces and do escape processing.
+ * At any time while connected to the serial console, one can return
+ * back to SMILO's main menu by sending an IP (Interrupt Process) telnet
+ * command.
  */
 
 #include <ETH.h>
@@ -172,6 +194,9 @@ static unsigned long  lasttick = 0;
 
 /* pin to get board power from */
 #define BOARD_PWR_PIN 17  /* SPI0:CS0, UEXT1 pin 10 */
+
+/* "reset" button */
+#define ESP_BUT1_PIN  34
 /* }}} */
 
 /* {{{ EEPROM */
@@ -216,10 +241,19 @@ static struct {
   { VAR_CYCLEMS,  "cyclems",    VARTPE_INT,   (void *)200     },
   { VAR_USERNAME, "username",   VARTPE_STR,   (void *)"ADMIN" },
   { VAR_PASSWORD, "password",   VARTPE_STR,   (void *)"ADMIN" }
+#define MAX_DEFVAL_SIZE  5
+#define MAX_VARNAME_SIZE 8
 };
 
 void
 eeprom_wipe()
+{
+  EEPROM.writeBytes(0, "WIPE", 4);
+  EEPROM.commit();
+}
+
+void
+eeprom_init()
 {
   int addr = 0;
 
@@ -255,23 +289,27 @@ eeprom_get_var(eeprom_var var)
     valkind = valtype & 31;  /* right 5 bits */
     valtype >>= 5;           /* left 3 bits */
 
-    switch (valkind) {
+    switch (valtype) {
       case VARTPE_STR:
         strvallen = EEPROM.readUInt(addr);
         addr += 4;
-        /* truncate, string if it is too long */
-        len = strvallen;
-        if (len > sizeof(_eeprom_var_retbuf) - 1)
-          len = sizeof(_eeprom_var_retbuf) - 1;
-        EEPROM.readBytes(addr, (void *)_eeprom_var_retbuf, len);
+        if (valkind == (uint32_t)var) {
+          /* truncate, string if it is too long */
+          len = strvallen;
+          if (len > sizeof(_eeprom_var_retbuf) - 1)
+            len = sizeof(_eeprom_var_retbuf) - 1;
+          EEPROM.readBytes(addr, (void *)_eeprom_var_retbuf, len);
+          _eeprom_var_retbuf[len] = '\0';
+          retval = _eeprom_var_retbuf;
+        }
         addr += strvallen;
-        _eeprom_var_retbuf[len] = '\0';
-        retval = _eeprom_var_retbuf;
         break;
       case VARTPE_INT:
-        len = EEPROM.readUInt(addr);
+        if (valkind == (uint32_t)var) {
+          len = EEPROM.readUInt(addr);
+          retval = (void *)len;
+        }
         addr += 4;
-        retval = (void *)len;
         break;
       default:
         /* ignore this value, we don't know how to handle it */
@@ -279,11 +317,6 @@ eeprom_get_var(eeprom_var var)
         break;
     }
 
-#if DEBUG
-    Serial.printf("EEPROM val %u, type %u, retval %p (%u/%s)\n",
-                  valkind, valtype, retval,
-                  retval ? (unsigned int)retval : 0, retval);
-#endif
     if (valkind == (uint32_t)var)
       break;
   }
@@ -292,6 +325,8 @@ eeprom_get_var(eeprom_var var)
     retval = eeprom_typemap[var].defval;
   return retval;
 }
+#define eeprom_get_var_int(VAR)  (uint32_t)eeprom_get_var(VAR)
+#define eeprom_get_var_str(VAR)  (char *)eeprom_get_var(VAR)
 
 void
 eeprom_set_var(eeprom_var var, void *val)
@@ -316,14 +351,22 @@ eeprom_set_var(eeprom_var var, void *val)
     valkind = valtype & 31;  /* right 5 bits */
     valtype >>= 5;           /* left 3 bits */
 
-    switch (valkind) {
+    /* stop as soon as we find something that doesn't make sense */
+    if (valkind < VAR_FIRST || valtype > VAR_LAST) {
+      writedata = true;
+      break;
+    }
+
+    switch (valtype) {
       case VARTPE_STR:
         strvallen = EEPROM.readUInt(raddr);
+        raddr += 4 + strvallen;
 
-        if (valtype == var) {
+        if (valkind == var) {
           /* omit the entire value, we need to write it later, start
            * filling up the gap */
           writedata = true;
+          addvalue  = true;
           break;
         }
 
@@ -332,7 +375,7 @@ eeprom_set_var(eeprom_var var, void *val)
           waddr++;
           EEPROM.writeUInt(waddr, strvallen);
           waddr += 4;
-          raddr += 4;
+          raddr -= strvallen;
           while (strvallen > 0) {
             EEPROM.writeByte(waddr, EEPROM.readByte(raddr));
             raddr++;
@@ -340,29 +383,25 @@ eeprom_set_var(eeprom_var var, void *val)
             strvallen--;
           }
         } else {
-          raddr += 4 + strvallen;
           waddr += 1 + 4 + strvallen;
         }
 
         break;
       case VARTPE_INT:
         len = EEPROM.readUInt(raddr);
-
-        if (valtype == var) {
-          /* fixed-width types can be updated in-place */
-          EEPROM.writeUInt(waddr, (unsigned int)val);
-          addvalue = false;
-        }
         raddr += 4;
 
-        if (writedata) {
-          EEPROM.writeByte(waddr, valtype);
-          waddr++;
-          EEPROM.writeUInt(waddr, len);
-          waddr += 4;
-        } else {
-          waddr += 1 + 4;
+        if (valkind == var) {
+          /* fixed-width types can be updated in-place */
+          len = (unsigned int)val;
+          addvalue = false;
         }
+
+        if (writedata || valkind == var) {
+          EEPROM.writeByte(waddr, valtype);
+          EEPROM.writeUInt(waddr, len);
+        }
+        waddr += 1 + 4;
         break;
       default:
         /* ignore this value, we don't know how to handle it,
@@ -373,10 +412,10 @@ eeprom_set_var(eeprom_var var, void *val)
   }
 
   if (addvalue) {
-    valtype = (eeprom_typemap[var].type << 5) | (var & 31);
+    valtype = (eeprom_typemap[var].type << 5) | ((int)var & 31);
     EEPROM.writeByte(waddr, valtype);
     waddr++;
-    switch (var) {
+    switch (eeprom_typemap[var].type) {
       case VARTPE_STR:
         strvallen = strlen((char *)val);
         EEPROM.writeUInt(waddr, strvallen);
@@ -385,7 +424,7 @@ eeprom_set_var(eeprom_var var, void *val)
         waddr += strvallen;
         break;
       case VARTPE_INT:
-        EEPROM.writeUInt(waddr, *((int *)val));
+        EEPROM.writeUInt(waddr, (unsigned int)val);
         waddr += 4;
         break;
     }
@@ -399,6 +438,9 @@ eeprom_set_var(eeprom_var var, void *val)
 
   EEPROM.commit();
 }
+/* arduino doesn't seem to have ptr_t, use size_t instead */
+#define eeprom_set_var_int(VAR,VAL)  eeprom_set_var(VAR,(void *)(size_t)VAL)
+#define eeprom_set_var_str(VAR,VAL)  eeprom_set_var(VAR,(void *)VAL)
 /* }}} */
 
 /* {{{ HTTP */
@@ -416,8 +458,8 @@ WebServer  http(80);
 bool http_handle_auth() {
   /* cache this statically, because HTTP request will look this up over
    * and over again */
-  static char *user = (char *)eeprom_get_var(VAR_USERNAME);
-  static char *pass = (char *)eeprom_get_var(VAR_PASSWORD);
+  static char *user = strdup(eeprom_get_var_str(VAR_USERNAME));
+  static char *pass = strdup(eeprom_get_var_str(VAR_PASSWORD));
 
   if (!http.authenticate(user, pass)) {
     http.requestAuthentication(BASIC_AUTH,
@@ -447,7 +489,7 @@ void http_handle_trigger_power() {
   clients_history_write_bytes(msg, msgsiz);
 
   digitalWrite(POWER_PIN, HIGH);
-  delay(200);
+  delay(eeprom_get_var_int(VAR_CYCLEMS));
   digitalWrite(POWER_PIN, LOW);
   http.send(200, "text/plain", "power button was pressed");
 }
@@ -485,7 +527,7 @@ void http_handle_trigger_reset() {
   clients_history_write_bytes(msg, msgsiz);
 
   digitalWrite(RESET_PIN, HIGH);
-  delay(200);
+  delay(eeprom_get_var_int(VAR_CYCLEMS));
   digitalWrite(RESET_PIN, LOW);
   http.send(200, "text/plain", "reset button was pressed");
 }
@@ -507,12 +549,12 @@ void http_handle_config_reset() {
   http.send(200, "text/plain",
             "configuration reset successful, please wait while board reboots");
   eeprom_wipe();
-  delay(2000);
+  delay(200);
   ESP.restart();
 }
 
 void http_handle_root() {
-  static char *hostname = (char *)eeprom_get_var(VAR_HOSTNAME);
+  static char *hostname = strdup(eeprom_get_var_str(VAR_HOSTNAME));
   size_t drlen = sizeof(histbuf) + 1024;
   char *dataresponse;
 
@@ -531,6 +573,7 @@ void http_handle_root() {
   snprintf(dataresponse, drlen,
            "<html><head><title>SMiLO - %s</title></head>"
            "<body><h1>SMiLO - %s</h1>"
+           "<p>MAC: %s</p>"
            "<ul>"
            "<li><a href='/trigger/reset'>reset</a></li>"
            "<li><a href='/trigger/power'>power</a></li>"
@@ -542,6 +585,7 @@ void http_handle_root() {
            "</body>"
            "</html>",
            hostname, hostname,
+           ETH.macAddress().c_str(),
            (int)(histbuflen - histbufpos), &histbuf[histbufpos],
            (int)histbufpos, histbuf);
 
@@ -566,13 +610,13 @@ struct scs_auth {
   int       usernamelen;
   char      password[SCSA_BUFMAXLEN];
   int       passwordlen;
+  int       authtries;
 }           auth;
 
 typedef enum client_menu_state {
   SCSM_INIT = 0,
   SCSM_SEND_MAIN,
   SCSM_RECV_MAIN,
-  SCSM_SEND_PROP,
   SCSM_SEND_RESET,
   SCSM_SEND_POWER,
   SCSM_SEND_POWER5S
@@ -581,6 +625,23 @@ typedef enum client_menu_state {
 struct scs_menu {
   void *dummy;
 };
+
+typedef enum client_prop_state {
+  SCSP_INIT = 0,
+  SCSP_SEND_PROP,
+  SCSP_RECV_PROP,
+  SCSP_RECV_VAL,
+  SCSP_RECV_PASSCHK
+} client_prop_state;
+
+struct scs_prop {
+#define SCSP_BUFMAXLEN 64
+  char       buf[SCSP_BUFMAXLEN];
+  int        buflen;
+  char       passcheck[SCSA_BUFMAXLEN];
+  int        passchecklen;
+  eeprom_var var;
+}            prop;
 
 typedef enum client_sol_state {
   SCSS_INIT = 0,
@@ -593,9 +654,12 @@ struct scs_sol {
 
 typedef enum client_state {
   SCS_FREE = 0,
+  SCS_STOP,
   SCS_AUTH,
   SCS_MENU,
-  SCS_SOL
+  SCS_PROP,
+  SCS_SOL,
+  SCS_INTR
 } client_state;
 
 typedef struct client {
@@ -610,6 +674,8 @@ typedef struct client {
                 auth;
     struct scs_menu
                 menu;
+    struct scs_prop
+                prop;
     struct scs_sol
                 sol;
   }             statectx;
@@ -696,19 +762,31 @@ static uint8_t telnet_read(int id)
       switch (chr) {
         case 241: /* NOP */
           /* ignore */
-          chr = 0;
-          break;
+          return 0;
         case 243: /* Break */
-          chr = 0;
-          break;
-        case 246: /* AYT */
+          /* maybe one day, be able to send Magic SysRq?
+           * 0x38 Alt
+           * 0x54     + print-screen
+           * ...                     + command char
+           * ...                       release
+           * 0xd4       release
+           * 0xb8 release
+           * how to get the key to press and put it inside this riddle? */
+          return 0;
+        case 244: /* Interrupt Process */
+          /* bring us back to the main menu */
+          if (cl->state != SCS_AUTH) {
+            cl->state = SCS_INTR;
+            cl->seq   = 0;
+            cl->connection.write("\r\n[interrupt]\r\n");
+          }
+          return 0;
+        case 246: /* Are You There? */
           /* are you there, just answer the question */
           cl->connection.write("Yes!\r\n");
-          chr = 0;
-          break;
+          return 0;
         case 247: /* Erase-Character */
           chr = 127;  /* DEL */
-          Serial.printf("received EC\n");
           break;
         case 251: /* WILL */
         case 252: /* WONT */
@@ -751,8 +829,7 @@ static uint8_t telnet_read(int id)
                 Serial.printf("sent %s %u\n", opttostr(refuse(chr)), option);
                 break;
             }
-            chr = 0;
-            break;
+            return 0;
           }
         case 255: /* IAC */
           /* forward to client */
@@ -777,6 +854,34 @@ static uint8_t telnet_read(int id)
   }
 
   return 0;
+}
+
+bool telnet_read_string(int id, bool echo, char *buf, int bufsiz, int *buflen)
+{
+  uint8_t chr;
+
+  while ((chr = telnet_read(id)) != 0) {
+    if (chr == '\n') {
+      /* hooray, end of string, always echo this to confirm on client side */
+      clients_console_write_bytes((char *)&chr, 1, id);
+      break;
+    } else if (chr == 127) {  /* DEL */
+      /* remove from buf, if not at start already */
+      if (*buflen > 0)
+        (*buflen)--;
+      else
+        continue;  /* don't echo it back */
+    } else {
+      /* append char if it fits */
+      if (*buflen < bufsiz)
+        buf[(*buflen)++] = (char)chr;
+    }
+    /* echo it back to the client */
+    if (echo)
+      clients_console_write_bytes((char *)&chr, 1, id);
+  }
+
+  return chr != 0;
 }
 
 void clients_handle_state(int id)
@@ -821,52 +926,29 @@ void clients_handle_state(int id)
           case SCSA_RECV_USER:
           case SCSA_RECV_PASS:
             {
-              uint8_t chr;
-              char *buf;
-              int *buflen;
-
               if (seq == SCSA_RECV_USER) {
-                buf = ctx->username;
-                buflen = &ctx->usernamelen;
+                if (telnet_read_string(id, true,
+                                       ctx->username,
+                                       SCSA_BUFMAXLEN,
+                                       &ctx->usernamelen))
+                  seq = SCSA_SEND_PASS;
               } else if (seq == SCSA_RECV_PASS) {
-                buf = ctx->password;
-                buflen = &ctx->passwordlen;
-              }
-
-              while ((chr = telnet_read(id)) != 0) {
-                if (chr == '\n') {
-                  /* hooray, end of string */
-                  clients_console_write_bytes((char *)&chr, 1, id);
-                  if (seq == SCSA_RECV_USER)
-                    seq = SCSA_SEND_PASS;
-                  else if (seq == SCSA_RECV_PASS)
-                    seq = SCSA_CHECK_CRED;
-                  break;
-                } else if (chr == 127) {  /* DEL */
-                  /* remove from buf, if not at start already */
-                  if (*buflen > 0)
-                    (*buflen)--;
-                  else
-                    continue;  /* don't echo it back */
-                } else {
-                  /* append char if it fits */
-                  if (*buflen < SCSA_BUFMAXLEN) {
-                    buf[*buflen] = (char)chr;
-                    (*buflen)++;
-                  }
-                }
-                /* echo it back to the client */
-                if (seq == SCSA_RECV_USER)
-                  clients_console_write_bytes((char *)&chr, 1, id);
+                if (telnet_read_string(id, false,
+                                       ctx->password,
+                                       SCSA_BUFMAXLEN,
+                                       &ctx->passwordlen))
+                  seq = SCSA_CHECK_CRED;
               }
             }
             break;
           case SCSA_CHECK_CRED:
             {
-              char *user = (char *)eeprom_get_var(VAR_USERNAME);
-              int userlen = (int)strlen(user);
-              char *pass = (char *)eeprom_get_var(VAR_PASSWORD);
-              int passlen = (int)strlen(pass);
+              char user[64];
+              char pass[64];
+              int userlen = (int)snprintf(user, sizeof(user), "%s",
+                                          eeprom_get_var_str(VAR_USERNAME));
+              int passlen = (int)snprintf(pass, sizeof(pass), "%s",
+                                          eeprom_get_var_str(VAR_PASSWORD));
 
               if (userlen != ctx->usernamelen ||
                   passlen != ctx->passwordlen ||
@@ -875,6 +957,9 @@ void clients_handle_state(int id)
               {
                 cl->connection.printf("Authentication failure.\r\n\r\n");
                 seq = SCSA_SEND_USER;
+                ctx->authtries++;
+                if (ctx->authtries >= 3)
+                  cl->state = SCS_STOP;
               }
               else
               {
@@ -882,8 +967,9 @@ void clients_handle_state(int id)
                 cl->state = SCS_MENU;
                 seq = SCSA_INIT;
               }
-              /* for security, wipe whatever we have */
-              memset(ctx, 0, sizeof(*ctx));
+              /* for security, wipe whatever we got */
+              memset(ctx->username, 0, SCSA_BUFMAXLEN);
+              memset(ctx->password, 0, SCSA_BUFMAXLEN);
             }
             break;
         }
@@ -898,7 +984,9 @@ void clients_handle_state(int id)
           case SCSM_INIT:
             memset(ctx, 0, sizeof(*ctx));
             seq = SCSM_SEND_MAIN;
-            cl->connection.printf("SMILO\r\n");
+            cl->connection.printf("SMILO                        "
+                                  "                             %s\r\n",
+                                  ETH.macAddress().c_str());
             break;
           case SCSM_SEND_MAIN:
             cl->connection.printf("\r\n"
@@ -910,6 +998,7 @@ void clients_handle_state(int id)
                                   "4. press [p]ower button\r\n"
                                   "5. hold [P]ower button\r\n"
                                   "6. [d]isconnect\r\n"
+                                  "7. reboot SMILO\r\n"
                                   "\n"
                                   "Please enter your choice: ",
                                   digitalRead(BOARD_PWR_PIN) == HIGH ?
@@ -929,7 +1018,8 @@ void clients_handle_state(int id)
                     break;
                   case '2':
                   case 'o':
-                    seq = SCSM_SEND_PROP;
+                    cl->state = SCS_PROP;
+                    seq = SCSM_INIT;
                     cl->connection.printf("properties\r\n\n");
                     break;
                   case '3':
@@ -951,40 +1041,22 @@ void clients_handle_state(int id)
                   case 'q':
                   case 'd':
                     cl->connection.printf("disconnect\r\n\nBye!\r\n");
+                    cl->state = SCS_STOP;
+                    break;
+                  case '7':
                     cl->connection.stop();
+                    delay(eeprom_get_var_int(VAR_CYCLEMS));
+                    ESP.restart();
                     break;
                   default:
-                    cl->connection.printf("\r\ninvalid option: '%c'\r\n", chr);
+                    if (chr >= ' ' && chr <= '~')
+                      cl->connection.printf("\r\n"
+                                            "invalid option: '%c'\r\n", chr);
                     seq = SCSM_SEND_MAIN;
                     break;
                 }
               }
             }
-            break;
-          case SCSM_SEND_PROP:
-            {
-              int i;
-
-              cl->connection.printf("properties:\r\n"
-                                   "\n");
-              for (i = (int)VAR_FIRST; i < (int)VAR_LAST; i++) {
-                if (eeprom_typemap[i].type == VARTPE_STR) {
-                  cl->connection.printf("%2d. %-10s  %-15s  [%s]\r\n",
-                                       i, eeprom_typemap[i].varname,
-                                       eeprom_get_var((eeprom_var)i),
-                                       (char *)eeprom_typemap[i].defval);
-                } else if (eeprom_typemap[i].type == VARTPE_INT) {
-                  cl->connection.printf("%2d. %-10s  %-15d  [%d]\r\n",
-                                       i, eeprom_typemap[i].varname,
-                                       (int)eeprom_get_var((eeprom_var)i),
-                                       (int)eeprom_typemap[i].defval);
-                }
-              }
-              cl->connection.printf("%2d. %-10s  %-15s\r\n",
-                                    i, eeprom_typemap[i].varname,
-                                    "*****");
-            }
-            seq = SCSM_SEND_MAIN;
             break;
           case SCSM_SEND_RESET:
           case SCSM_SEND_POWER:
@@ -1019,13 +1091,161 @@ void clients_handle_state(int id)
               if (seq == SCSM_SEND_POWER5S)
                 delay(5000);
               else
-                delay(200);
+                delay(eeprom_get_var_int(VAR_CYCLEMS));
               digitalWrite(pin, LOW);
 
               cl->connection.printf("done\r\n");
 
               seq = SCSM_SEND_MAIN;
             }
+            break;
+        }
+        cl->seq = (int)seq;
+      }
+      break;
+    case SCS_PROP:
+      {
+        struct scs_prop *ctx = &cl->statectx.prop;
+        client_prop_state seq = (client_prop_state)cl->seq;
+        switch (seq) {
+          case SCSP_INIT:
+            memset(ctx, 0, sizeof(*ctx));
+            seq = SCSP_SEND_PROP;
+            break;
+          case SCSP_SEND_PROP:
+            {
+              int i;
+
+              cl->connection.printf("properties:\r\n"
+                                   "\n");
+              cl->connection.printf(" 0. wipe configuration "
+                                    "(reboots SMILO)\r\n");
+#define MAX_VAL_SIZE (80 - 3 - 1 - MAX_VARNAME_SIZE - 2 - \
+                      2 - 1 - MAX_DEFVAL_SIZE - 1 - 1/* keep one char */)
+              for (i = (int)VAR_FIRST; i < (int)VAR_LAST; i++) {
+                if (eeprom_typemap[i].type == VARTPE_STR) {
+                  cl->connection.printf("%2d. %*s  %*s  [%*s]\r\n",
+                                       i, -1 * MAX_VARNAME_SIZE,
+                                       eeprom_typemap[i].varname,
+                                       -1 * MAX_VAL_SIZE,
+                                       eeprom_get_var_str((eeprom_var)i),
+                                       -1 * MAX_DEFVAL_SIZE,
+                                       (char *)eeprom_typemap[i].defval);
+                } else if (eeprom_typemap[i].type == VARTPE_INT) {
+                  cl->connection.printf("%2d. %*s  %*u  [%*u]\r\n",
+                                       i, -1 * MAX_VARNAME_SIZE,
+                                       eeprom_typemap[i].varname,
+                                       -1 * MAX_VAL_SIZE,
+                                       eeprom_get_var_int((eeprom_var)i),
+                                       -1 * MAX_DEFVAL_SIZE,
+                                       (uint32_t)eeprom_typemap[i].defval);
+                }
+              }
+              cl->connection.printf("%2d. %*s  %*s\r\n",
+                                    i, -1 * MAX_VARNAME_SIZE,
+                                    eeprom_typemap[i].varname,
+                                    -1 * MAX_VAL_SIZE,
+                                    "*****");
+              cl->connection.printf(" q. return to main menu\r\n"
+                                    "\r\n"
+                                    "Enter property number: ");
+            }
+            seq = SCSP_RECV_PROP;
+            break;
+          case SCSP_RECV_PROP:
+            if (!telnet_read_string(id, true,
+                                    ctx->buf,
+                                    SCSP_BUFMAXLEN - 1,
+                                    &ctx->buflen))
+              break;
+            ctx->buf[ctx->buflen] = '\0';
+
+            /* handle wipe separately, so we can rely on strtol from here */
+            if (ctx->buflen == 1 && ctx->buf[0] == '0') {
+              eeprom_wipe();
+              delay(eeprom_get_var_int(VAR_CYCLEMS));
+              ESP.restart();
+            }
+            else if (ctx->buflen == 1 && ctx->buf[0] == 'q') {
+              cl->state = SCS_MENU;
+              seq = SCSP_INIT;
+            }
+            else
+            {
+              long prop = strtol(ctx->buf, NULL, 10);
+              if (prop <= 0 || prop > (long)VAR_LAST) {
+                cl->connection.printf("invalid property: %s\r\n", ctx->buf);
+                seq = SCSP_INIT;
+              } else {
+                ctx->var = eeprom_typemap[prop].var;
+                seq = SCSP_RECV_VAL;
+                ctx->buflen = 0;
+                cl->connection.printf("enter new %s: ",
+                                      eeprom_typemap[ctx->var].varname);
+              }
+            }
+            break;
+          case SCSP_RECV_VAL:
+          case SCSP_RECV_PASSCHK:
+            if (ctx->var == VAR_PASSWORD) {
+              if (!telnet_read_string(id, false,
+                                      ctx->buf, SCSA_BUFMAXLEN - 1,
+                                      &ctx->buflen))
+                break;
+              ctx->buf[ctx->buflen] = '\0';
+
+              if (seq == SCSP_RECV_VAL) {
+                memcpy(ctx->passcheck, ctx->buf, ctx->buflen);
+                ctx->passchecklen = ctx->buflen;
+                ctx->buflen = 0;
+                seq = SCSP_RECV_PASSCHK;
+                cl->connection.printf("enter %s again: ",
+                                      eeprom_typemap[VAR_PASSWORD].varname);
+                break;
+              }
+
+              if (ctx->passchecklen != ctx->buflen ||
+                  memcmp(ctx->passcheck, ctx->buf, ctx->buflen) != 0)
+              {
+                cl->connection.printf("passwords do not match\r\n");
+              } else if (ctx->buflen == 0) {
+                cl->connection.printf("cannot set password to "
+                                      "empty string\r\n");
+              } else {
+                eeprom_set_var_str(ctx->var, ctx->buf);
+              }
+              memset(ctx->buf, 0, ctx->buflen);
+              memset(ctx->passcheck, 0, ctx->passchecklen);
+            } else {
+              if (!telnet_read_string(id, true,
+                                      ctx->buf,
+                                      SCSP_BUFMAXLEN - 1,
+                                      &ctx->buflen))
+                break;
+              ctx->buf[ctx->buflen] = '\0';
+
+              if (eeprom_typemap[ctx->var].type == VARTPE_INT) {
+                int val = (int)strtol(ctx->buf, NULL, 10);
+                if (ctx->buflen == 0) {
+                  val = (int)(eeprom_typemap[ctx->var].defval);
+                  cl->connection.printf("setting default value %ld\n", val);
+                }
+                eeprom_set_var_int(ctx->var, val);
+              } else if (eeprom_typemap[ctx->var].type == VARTPE_STR) {
+                if (ctx->buflen == 0) {
+                  cl->connection.printf("setting default value %s\n",
+                                        eeprom_typemap[ctx->var].defval);
+                  eeprom_set_var(ctx->var,
+                                 eeprom_typemap[ctx->var].defval);
+                }
+                else
+                {
+                  eeprom_set_var_str(ctx->var, ctx->buf);
+                }
+              }
+            }
+
+            seq = SCSP_INIT;
             break;
         }
         cl->seq = (int)seq;
@@ -1057,6 +1277,13 @@ void clients_handle_state(int id)
         cl->seq = (int)seq;
       }
       break;
+    case SCS_INTR:
+      /* special case triggered by IP signal meant to wipe seq so we
+       * will always return at the main/init that was instructed to
+       * (provisions for bypassing authentication are met) */
+      cl->state = SCS_MENU;
+      cl->seq   = 0;
+      break;
   }
 }
 /* }}} */
@@ -1067,12 +1294,12 @@ void clients_handle_state(int id)
  * server_ready global is set from here */
 void net_handle_event(WiFiEvent_t event) {
   switch (event) {
-    case ARDUINO_EVENT_ETH_START: {
-      char *hostname = (char *)eeprom_get_var(VAR_HOSTNAME);
+    case ARDUINO_EVENT_ETH_START:
+      ETH.setHostname(eeprom_get_var_str(VAR_HOSTNAME));
+
       Serial.printf("MAC address: %s\n", ETH.macAddress().c_str());
-      Serial.printf("Hostname: %s\n", hostname);
-      ETH.setHostname(hostname);
-    } break;
+      Serial.printf("Hostname: %s\n", ETH.getHostname());
+      break;
     case ARDUINO_EVENT_ETH_CONNECTED:
       Serial.printf("Ethernet link up: %uMbps, %s duplex\n",
                     ETH.linkSpeed(), ETH.fullDuplex() ? "full" : "half");
@@ -1120,15 +1347,19 @@ void net_handle_event(WiFiEvent_t event) {
  * called once during startup */
 void setup() {
   char eeprom_magic[4];
+  bool initeeprom = false;
 
   Serial.begin(115200);
   EEPROM.begin(EEPROM_SIZE);
-  delay(2000);
+  delay(200);
 
   /* check magic for EEPROM, else wipe */
   if (EEPROM.readBytes(0, eeprom_magic, 4) != 4 ||
       memcmp(eeprom_magic, EEPROM_MAGIC, 4) != 0)
-    eeprom_wipe();
+  {
+    eeprom_init();
+    initeeprom = true;
+  }
 
   Serial.printf("Setting up ethernet %s\n",
                 ETH_TYPE == ETH_PHY_LAN8720 ? "LAN8720" : "TLK110");
@@ -1136,14 +1367,42 @@ void setup() {
   ETH.begin(ETH_ADDR, ETH_POWER_PIN, ETH_MDC_PIN,
   			    ETH_MDIO_PIN, ETH_TYPE, ETH_CLK_MODE);
 
+  /* we need MAC address to init, for which we need above ETH.begin */
+  if (initeeprom) {
+    char  hostnamebuf[32];
+    char *p;
+    char *q;
+
+    /* set "stock" hostname, that includes unique MAC */
+    snprintf(hostnamebuf, sizeof(hostnamebuf), "smilo-%s",
+             ETH.macAddress().c_str());
+    /* lowercase and remove : to make it valid */
+    for (p = hostnamebuf, q = p; *p != '\0'; p++) {
+      if ((*p >= '0' && *p <= '9') ||
+          (*p >= 'a' && *p <= 'z') ||
+          *p == '-' || *p == '_')
+        *q++ = *p;
+      else if (*p >= 'A' && *p <= 'Z')
+        *q++ = tolower(*p);
+    }
+    *q++ = '\0';
+    Serial.printf("Setting default hostname %s\n", hostnamebuf);
+    eeprom_set_var_str(VAR_HOSTNAME, hostnamebuf);
+    /* restart to make the hostname active */
+    delay(200);
+    ESP.restart();
+  }
+
   Serial.println("Setting up serial connection: 115200 baud");
   Serial1.begin(115200, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN, true);
 
   Serial.println("Setting up power and reset pins for output");
   pinMode(POWER_PIN, OUTPUT);
   pinMode(RESET_PIN, OUTPUT);
-  Serial.printf("Setting up host board power state pin for input");
+  Serial.println("Setting up host board power state pin for input");
   pinMode(BOARD_PWR_PIN, INPUT_PULLDOWN);
+
+  pinMode(ESP_BUT1_PIN, INPUT);
 }
 /* }}} */
 
@@ -1156,6 +1415,14 @@ void loop() {
   int connected_clients;
   size_t savail;
   WiFiClient newclient;
+  static int laststate = digitalRead(ESP_BUT1_PIN);
+
+  if (digitalRead(ESP_BUT1_PIN) != laststate) {
+    Serial.println("Reset button BUT1 pressed, performing EEPROM wipe");
+    eeprom_wipe();
+    delay(200);
+    ESP.restart();
+  }
 
   if (!server_ready)
     goto snooze;
@@ -1212,8 +1479,11 @@ void loop() {
   connected_clients = 0;
   for (i = 0; i < MAX_SRV_CLIENTS; i++) {
     if (clients[i].state != SCS_FREE) {
-      if (!clients[i].connection.connected()) {
-        Serial.printf("Lost connection from %s:%u after %us\n",
+      if (clients[i].state == SCS_STOP ||
+          !clients[i].connection.connected())
+      {
+        Serial.printf("%s connection from %s:%u after %us\n",
+                      clients[i].state == SCS_STOP ? "Closed" : "Lost",
                       clients[i].connection.remoteIP().toString().c_str(),
                       clients[i].connection.remotePort(),
                       (millis() - clients[i].connect_at) / 1000);
