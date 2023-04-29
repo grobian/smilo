@@ -21,6 +21,10 @@ Buiding SMILO
 SMILO currently is built using Arduino IDE.  Select the OLIMEX ESP32-EVB
 as board, and compile/upload.
 
+Alternatively, use [platformio](https://docs.platformio.org/) to build
+SMILO without the need for an IDE.  For that, just install platformio,
+and run `pio run` from the top level directory of this repository.
+
 
 Author
 ------
