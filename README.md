@@ -23,7 +23,8 @@ as board, and compile/upload.
 
 Alternatively, use [platformio](https://docs.platformio.org/) to build
 SMILO without the need for an IDE.  For that, just install platformio,
-and run `pio run` from the top level directory of this repository.
+and run `pio run -t upload` from the top level directory of this
+repository.
 
 
 Author
