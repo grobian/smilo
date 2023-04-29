@@ -1163,7 +1163,8 @@ void clients_handle_state(int id)
             /* handle wipe separately, so we can rely on strtol from here */
             if (ctx->buflen == 1 && ctx->buf[0] == '0') {
               eeprom_wipe();
-              delay(eeprom_get_var_int(VAR_CYCLEMS));
+              delay(200);
+              cl->connection.stop();
               ESP.restart();
             }
             else if (ctx->buflen == 1 && ctx->buf[0] == 'q') {
