@@ -232,9 +232,9 @@ typedef enum eeprom_type {
 
 static struct {
   eeprom_var      var;
-  char           *varname;
+  const char     *varname;
   eeprom_vartype  type;
-  void           *defval;
+  const void     *defval;
 } eeprom_typemap[] = {
   { (eeprom_var)0, NULL, (eeprom_vartype)0, NULL }, /* unset, slot 0 */
   { VAR_HOSTNAME, "hostname",   VARTPE_STR,   (void *)"smilo" },
@@ -266,15 +266,15 @@ eeprom_init()
 }
 
 char _eeprom_var_retbuf[256];
-void *
+const void *
 eeprom_get_var(eeprom_var var)
 {
-  int      addr = sizeof(EEPROM_MAGIC) - 1;
-  uint32_t valtype;
-  uint32_t valkind;
-  uint32_t strvallen;
-  uint32_t len;
-  void    *retval = NULL;
+  int         addr      = sizeof(EEPROM_MAGIC) - 1;
+  uint32_t    valtype;
+  uint32_t    valkind;
+  uint32_t    strvallen;
+  uint32_t    len;
+  const void *retval    = NULL;
 
   /* walk through EEPROM space for as long as we don't find the sentinel
    * or the end of EEPROM space */
@@ -329,7 +329,7 @@ eeprom_get_var(eeprom_var var)
 #define eeprom_get_var_str(VAR)  (char *)eeprom_get_var(VAR)
 
 void
-eeprom_set_var(eeprom_var var, void *val)
+eeprom_set_var(eeprom_var var, const void *val)
 {
   int      raddr     = sizeof(EEPROM_MAGIC) - 1;
   int      waddr     = sizeof(EEPROM_MAGIC) - 1;
