@@ -970,6 +970,8 @@ void clients_handle_state(int id)
               /* for security, wipe whatever we got */
               memset(ctx->username, 0, SCSA_BUFMAXLEN);
               memset(ctx->password, 0, SCSA_BUFMAXLEN);
+              ctx->usernamelen = 0;
+              ctx->passwordlen = 0;
             }
             break;
         }
