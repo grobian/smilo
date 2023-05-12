@@ -262,7 +262,7 @@ eeprom_init()
 {
   int addr = 0;
 
-  Serial.printf("Initialising EEPROM (size=%u bytes)\n", EEPROM_SIZE);
+  Serial.printf("Initialising EEPROM (size=%u bytes)\r\n", EEPROM_SIZE);
   EEPROM.writeBytes(0, EEPROM_MAGIC, 4);
   addr += 4;
   for (; addr < EEPROM_SIZE; addr++)
@@ -801,7 +801,7 @@ static uint8_t telnet_read(int id)
 #define opttostr(X) (X == 251 ? "WILL" : X == 252 ? "WON'T" : \
                      X == 253 ? "DO" : "DON'T")
             uint8_t option = cl->connection.read();
-            Serial.printf("received %s %u\n", opttostr(chr), option);
+            Serial.printf("received %s %u\r\n", opttostr(chr), option);
             switch (option) {
               case 1: /* ECHO */
               case 3: /* SUPPRESS-GO-AHEAD */
@@ -819,7 +819,7 @@ static uint8_t telnet_read(int id)
                 cl->connection.write(0xff);
                 cl->connection.write(mustdo(chr));
                 cl->connection.write(option);
-                Serial.printf("sent %s %u\n", opttostr(mustdo(chr)), option);
+                Serial.printf("sent %s %u\r\n", opttostr(mustdo(chr)), option);
                 break;
               case 24: /* TERMINAL-TYPE */
               case 31: /* WINDOW-SIZE */
@@ -829,7 +829,7 @@ static uint8_t telnet_read(int id)
                 cl->connection.write(0xff);
                 cl->connection.write(refuse(chr));
                 cl->connection.write(option);
-                Serial.printf("sent %s %u\n", opttostr(refuse(chr)), option);
+                Serial.printf("sent %s %u\r\n", opttostr(refuse(chr)), option);
                 break;
             }
             return 0;
@@ -838,13 +838,13 @@ static uint8_t telnet_read(int id)
           /* forward to client */
           break;
         default:
-          Serial.printf("received unknown command: %u\n", chr);
+          Serial.printf("received unknown command: %u\r\n", chr);
           break;
       }
     }
 #ifdef debug
     if (chr < 32 || chr >= 127)
-      Serial.printf("received control char %u\n", chr);
+      Serial.printf("received control char %u\r\n", chr);
 #endif
     /* map \r<NUL> or \r\n into \n */
     if (chr == '\r')
@@ -904,19 +904,19 @@ void clients_handle_state(int id)
             cl->connection.write(0xff);
             cl->connection.write(251);   /* WILL */
             cl->connection.write(1);     /* ECHO */
-            Serial.printf("sent WILL 1 (ECHO)\n");
+            Serial.printf("sent WILL 1 (ECHO)\r\n");
 
             /* linemode basically is in the way of echo, so disable */
             cl->connection.write(0xff);
             cl->connection.write(254);   /* DONT */
             cl->connection.write(34);    /* LINEMODE */
-            Serial.printf("sent DONT 34 (LINEMODE)\n");
+            Serial.printf("sent DONT 34 (LINEMODE)\r\n");
 
             /* this is newer, let's request it in any case */
             cl->connection.write(0xff);
             cl->connection.write(253);   /* DO */
             cl->connection.write(45);    /* SUPPRESS-LOCAL-ECHO */
-            Serial.printf("sent DO 45 (SUPPRESS-LOCAL-ECHO)\n");
+            Serial.printf("sent DO 45 (SUPPRESS-LOCAL-ECHO)\r\n");
             break;
           case SCSA_SEND_USER:
             cl->connection.write((uint8_t *)"username: ", 10);
@@ -989,7 +989,7 @@ void clients_handle_state(int id)
           case SCSM_INIT:
             memset(ctx, 0, sizeof(*ctx));
             seq = SCSM_SEND_MAIN;
-            cl->connection.printf("SMILO %-51s %s\r\n",
+            cl->connection.printf("SMILO  %-51s  [%s]\r\n",
                                   eeprom_get_var_str(VAR_HOSTNAME),
                                   ETH.macAddress().c_str());
             break;
@@ -1324,15 +1324,15 @@ void net_handle_event(WiFiEvent_t event) {
     case ARDUINO_EVENT_ETH_START:
       ETH.setHostname(eeprom_get_var_str(VAR_HOSTNAME));
 
-      Serial.printf("MAC address: %s\n", ETH.macAddress().c_str());
-      Serial.printf("Hostname: %s\n", ETH.getHostname());
+      Serial.printf("MAC address: %s\r\n", ETH.macAddress().c_str());
+      Serial.printf("Hostname: %s\r\n", ETH.getHostname());
       break;
     case ARDUINO_EVENT_ETH_CONNECTED:
-      Serial.printf("Ethernet link up: %uMbps, %s duplex\n",
+      Serial.printf("Ethernet link up: %uMbps, %s duplex\r\n",
                     ETH.linkSpeed(), ETH.fullDuplex() ? "full" : "half");
       break;
     case ARDUINO_EVENT_ETH_GOT_IP:
-      Serial.printf("Received address: %s gw %s dns %s\n",
+      Serial.printf("Received address: %s gw %s dns %s\r\n",
                     ETH.localIP().toString().c_str(),
                     ETH.gatewayIP().toString().c_str(),
                     ETH.dnsIP().toString().c_str());
@@ -1364,7 +1364,7 @@ void net_handle_event(WiFiEvent_t event) {
       server_ready = false;
       break;
     default:
-      Serial.printf("unhandled event %u\n", event);
+      Serial.printf("unhandled event %u\r\n", event);
       break;
   }
 }
@@ -1388,7 +1388,7 @@ void setup() {
     initeeprom = true;
   }
 
-  Serial.printf("Setting up ethernet %s\n",
+  Serial.printf("Setting up ethernet %s\r\n",
                 ETH_TYPE == ETH_PHY_LAN8720 ? "LAN8720" : "TLK110");
   WiFi.onEvent(net_handle_event);  /* counter-intuitive: but also for ETH */
   ETH.begin(ETH_ADDR, ETH_POWER_PIN, ETH_MDC_PIN,
@@ -1413,7 +1413,7 @@ void setup() {
         *q++ = tolower(*p);
     }
     *q++ = '\0';
-    Serial.printf("Setting default hostname %s\n", hostnamebuf);
+    Serial.printf("Setting default hostname %s\r\n", hostnamebuf);
     eeprom_set_var_str(VAR_HOSTNAME, hostnamebuf);
     /* restart to make the hostname active */
     delay(200);
@@ -1477,7 +1477,7 @@ void loop() {
       return;
     }
 
-    Serial.printf("New connection from %s:%u\n",
+    Serial.printf("New connection from %s:%u\r\n",
                   clients[i].connection.remoteIP().toString().c_str(),
                   clients[i].connection.remotePort());
     clients[i].connection.printf("[successfully connected to %s]\n",
@@ -1509,7 +1509,7 @@ void loop() {
       if (clients[i].state == SCS_STOP ||
           !clients[i].connection.connected())
       {
-        Serial.printf("%s connection from %s:%u after %us\n",
+        Serial.printf("%s connection from %s:%u after %us\r\n",
                       clients[i].state == SCS_STOP ? "Closed" : "Lost",
                       clients[i].connection.remoteIP().toString().c_str(),
                       clients[i].connection.remotePort(),
@@ -1526,10 +1526,10 @@ void loop() {
 
   if (lasttick + 30000 < millis()) {
     if (connected_clients > 0) {
-      Serial.printf("Connected clients: %u\n", connected_clients);
+      Serial.printf("Connected clients: %u\r\n", connected_clients);
       for (i = 0; i < MAX_SRV_CLIENTS; i++) {
         if (clients[i].state != SCS_FREE) {
-          Serial.printf("[%u] %s:%u for %us\n",
+          Serial.printf("[%u] %s:%u for %us\r\n",
                         i,
                         clients[i].connection.remoteIP().toString().c_str(),
                         clients[i].connection.remotePort(),
