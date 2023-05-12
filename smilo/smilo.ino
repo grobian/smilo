@@ -651,6 +651,7 @@ struct scs_prop {
 typedef enum client_sol_state {
   SCSS_INIT = 0,
   SCSS_SOL,
+  SCSS_BRK
 } client_sol_state;
 
 struct scs_sol {
@@ -769,19 +770,16 @@ static uint8_t telnet_read(int id)
           /* ignore */
           return 0;
         case 243: /* Break */
-          /* maybe one day, be able to send Magic SysRq?
-           * 0x38 Alt
-           * 0x54     + print-screen
-           * ...                     + command char
-           * ...                       release
-           * 0xd4       release
-           * 0xb8 release
-           * how to get the key to press and put it inside this riddle? */
+          if (cl->state == SCS_SOL) {
+            cl->seq = (int)SCSS_BRK;
+            cl->connection.write("\r\n[press key to send with "
+                                 "Magic SysReq]");
+          }
           return 0;
         case 244: /* Interrupt Process */
           /* bring us back to the main menu */
-          if (cl->state != SCS_AUTH) {
-            cl->state = SCS_INTR;
+          if (cl->state == SCS_SOL) {
+            cl->state = SCS_MENU;
             cl->seq   = 0;
             cl->connection.write("\r\n[interrupt]\r\n");
           }
@@ -1269,7 +1267,7 @@ void clients_handle_state(int id)
             clients_console_write_bytes((char *)&histbuf[histbufpos],
                                         histbuflen - histbufpos, id);
             clients_console_write_bytes((char *)histbuf, histbufpos, id);
-            seq = SCSS_SOL;
+            cl->seq = (int)SCSS_SOL;
             break;
           case SCSS_SOL:
             {
@@ -1281,16 +1279,37 @@ void clients_handle_state(int id)
                 Serial1.write(chr);
             }
             break;
+          case SCSS_BRK:
+            {
+              uint8_t chr;
+
+              /* handle BREAK signal from telnet, we turn it into a
+               * Magic SysRq, but need to know which one */
+
+              if ((chr = telnet_read(id)) != 0) {
+                cl->connection.write(chr);
+                cl->connection.write("\r\n");
+                /* now send Magic SysRq?
+                 * 0x38 Alt
+                 * 0x54     + print-screen
+                 * ...                     + command char
+                 * ...                       release
+                 * 0xd4       release
+                 * 0xb8 release
+                 * now let's do it */
+                Serial1.write(0x38);
+                Serial1.write(0x54);
+                Serial1.write(chr);         /* press */
+                Serial1.write(chr + 0x80);  /* release */
+                Serial1.write(0xd4);
+                Serial1.write(0xb8);
+                /* return to console */
+                cl->seq = (int)SCSS_SOL;
+              }
+            }
+            break;
         }
-        cl->seq = (int)seq;
       }
-      break;
-    case SCS_INTR:
-      /* special case triggered by IP signal meant to wipe seq so we
-       * will always return at the main/init that was instructed to
-       * (provisions for bypassing authentication are met) */
-      cl->state = SCS_MENU;
-      cl->seq   = 0;
       break;
   }
 }
