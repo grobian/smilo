@@ -357,7 +357,7 @@ eeprom_set_var(eeprom_var var, const void *val)
     valtype >>= 5;           /* left 3 bits */
 
     /* stop as soon as we find something that doesn't make sense */
-    if (valkind < VAR_FIRST || valtype > VAR_LAST) {
+    if (valkind < VAR_FIRST || valkind > VAR_LAST) {
       writedata = true;
       break;
     }
@@ -376,7 +376,7 @@ eeprom_set_var(eeprom_var var, const void *val)
         }
 
         if (writedata) {
-          EEPROM.writeByte(waddr, valtype);
+          EEPROM.writeByte(waddr, valtype << 5 | valkind);
           waddr++;
           EEPROM.writeUInt(waddr, strvallen);
           waddr += 4;
