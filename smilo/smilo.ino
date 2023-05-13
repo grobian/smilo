@@ -1531,7 +1531,7 @@ void loop() {
    * output usually is whole lines, this purposely doesn't use a loop so
    * we keep responsive doing other things when somehow the uart is
    * spamming like hell here */
-  if ((savail = Serial1.available()) > 0) {
+  for (i = 0; (savail = Serial1.available()) > 0 && i < 10; i++) {
     /* unfortunately using clients_history_write_bytes here would
      * require an extra copy, so this bit is an almost copy of that
      * function for the sake of some speed */
