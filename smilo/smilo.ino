@@ -126,6 +126,10 @@
 #include <EEPROM.h>
 #include <WebServer.h>
 
+#ifndef GIT_VERSION
+#define GIT_VERSION "unknown"
+#endif
+
 /* {{{ Ethernet configuration */
 /**
  * Ethernet settings taken from ETH_LAN8720 example.  All of these are
