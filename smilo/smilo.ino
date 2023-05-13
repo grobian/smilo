@@ -258,7 +258,7 @@ static struct {
   { VAR_CYCLEMS,  "press time ms",          VARTPE_INT, (void *)200     },
   { VAR_HOLDMS,   "hold time ms",           VARTPE_INT, (void *)5000    },
   { VAR_BAUD_ON,  "COM1 baudrate host on",  VARTPE_INT, (void *)115200  },
-  { VAR_BAUD_OFF, "COM1 baudrate host off", VARTPE_INT, (void *)9600    }
+  { VAR_BAUD_OFF, "COM1 baudrate host off", VARTPE_INT, (void *)50      }
 #define MAX_DEFVAL_SIZE  6
 #define MAX_VARNAME_SIZE 22
 };
