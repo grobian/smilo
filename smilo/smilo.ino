@@ -43,8 +43,6 @@
  *   or the alternative buffer call and reset the buffer for that
  *   (connect can show quite some past behaviour)
  *   handle erase in display, \033 [ (0|1|2|3|) J
- * - keep state of host power, and report changes on the connected
- *   clients
  * - respond to the USB serial connection, allow things like rebooting,
  *   config reset
  */
