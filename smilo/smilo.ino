@@ -196,6 +196,8 @@ static size_t         histbuflen = 0;
 static size_t         histbufpos = 0;
 /* timer var used to timeout stale connections */
 static unsigned long  lasttick = 0;
+/* whether we believe the host is powered on */
+static bool           host_powered_on = false;
 
 /* pin to get board power from */
 #define BOARD_PWR_PIN 17  /* SPI0:CS0, UEXT1 pin 10 */
@@ -221,13 +223,19 @@ static unsigned long  lasttick = 0;
  * updates therefore can move values to the end of the list.
  */
 
+/* NOTE: remember that this enum holds the keys for the values stored in
+ *       EEPROM, so do only APPEND to this list, as changing the order
+ *       will mess up existing configuration! */
 typedef enum eeprom_var {
-  VAR_HOSTNAME = 1,
-  VAR_CYCLEMS,
+  VAR_PASSWORD = 1,
   VAR_USERNAME,
-  VAR_PASSWORD
-#define VAR_FIRST VAR_HOSTNAME
-#define VAR_LAST  VAR_PASSWORD
+  VAR_HOSTNAME,
+  VAR_CYCLEMS,
+  VAR_HOLDMS,
+  VAR_BAUD_ON,
+  VAR_BAUD_OFF
+#define VAR_FIRST VAR_PASSWORD
+#define VAR_LAST  VAR_BAUD_OFF
 } eeprom_var;
 
 typedef enum eeprom_type {
@@ -242,12 +250,15 @@ static struct {
   const void     *defval;
 } eeprom_typemap[] = {
   { (eeprom_var)0, NULL, (eeprom_vartype)0, NULL }, /* unset, slot 0 */
-  { VAR_HOSTNAME, "hostname",   VARTPE_STR,   (void *)"smilo" },
-  { VAR_CYCLEMS,  "cyclems",    VARTPE_INT,   (void *)200     },
-  { VAR_USERNAME, "username",   VARTPE_STR,   (void *)"ADMIN" },
-  { VAR_PASSWORD, "password",   VARTPE_STR,   (void *)"ADMIN" }
-#define MAX_DEFVAL_SIZE  5
-#define MAX_VARNAME_SIZE 8
+  { VAR_PASSWORD, "password",               VARTPE_STR, (void *)"ADMIN" },
+  { VAR_USERNAME, "username/password",      VARTPE_STR, (void *)"ADMIN" },
+  { VAR_HOSTNAME, "hostname",               VARTPE_STR, (void *)"smilo" },
+  { VAR_CYCLEMS,  "press time ms",          VARTPE_INT, (void *)200     },
+  { VAR_HOLDMS,   "hold time ms",           VARTPE_INT, (void *)5000    },
+  { VAR_BAUD_ON,  "COM1 baudrate host on",  VARTPE_INT, (void *)115200  },
+  { VAR_BAUD_OFF, "COM1 baudrate host off", VARTPE_INT, (void *)9600    }
+#define MAX_DEFVAL_SIZE  6
+#define MAX_VARNAME_SIZE 22
 };
 
 void
@@ -1007,8 +1018,7 @@ void clients_handle_state(int id)
                                   "7. reboot SMILO\r\n"
                                   "\n"
                                   "Please enter your choice: ",
-                                  digitalRead(BOARD_PWR_PIN) == HIGH ?
-                                  "on" : "off");
+                                  host_powered_on ?  "on" : "off");
             seq = SCSM_RECV_MAIN;
             break;
           case SCSM_RECV_MAIN:
@@ -1124,11 +1134,11 @@ void clients_handle_state(int id)
 
               cl->connection.printf("properties:\r\n"
                                    "\n");
-              cl->connection.printf(" 0. wipe configuration "
+              cl->connection.printf(" 1. wipe configuration "
                                     "(reboots SMILO)\r\n");
 #define MAX_VAL_SIZE (80 - 3 - 1 - MAX_VARNAME_SIZE - 2 - \
                       2 - 1 - MAX_DEFVAL_SIZE - 1 - 1/* keep one char */)
-              for (i = (int)VAR_FIRST; i < (int)VAR_LAST; i++) {
+              for (i = (int)VAR_USERNAME; i <= (int)VAR_LAST; i++) {
                 if (eeprom_typemap[i].type == VARTPE_STR) {
                   cl->connection.printf("%2d. %*s  %*s  [%*s]\r\n",
                                        i, -1 * MAX_VARNAME_SIZE,
@@ -1143,15 +1153,10 @@ void clients_handle_state(int id)
                                        eeprom_typemap[i].varname,
                                        -1 * MAX_VAL_SIZE,
                                        eeprom_get_var_int((eeprom_var)i),
-                                       -1 * MAX_DEFVAL_SIZE,
+                                       MAX_DEFVAL_SIZE,
                                        (uint32_t)eeprom_typemap[i].defval);
                 }
               }
-              cl->connection.printf("%2d. %*s  %*s\r\n",
-                                    i, -1 * MAX_VARNAME_SIZE,
-                                    eeprom_typemap[i].varname,
-                                    -1 * MAX_VAL_SIZE,
-                                    "*****");
               cl->connection.printf(" q. return to main menu\r\n"
                                     "\r\n"
                                     "Enter property number: ");
@@ -1166,14 +1171,8 @@ void clients_handle_state(int id)
               break;
             ctx->buf[ctx->buflen] = '\0';
 
-            /* handle wipe separately, so we can rely on strtol from here */
-            if (ctx->buflen == 1 && ctx->buf[0] == '0') {
-              eeprom_wipe();
-              delay(200);
-              cl->connection.stop();
-              ESP.restart();
-            }
-            else if (ctx->buflen == 1 && ctx->buf[0] == 'q') {
+            /* handle quit, so we can rely on strtol from here */
+            if (ctx->buflen == 1 && ctx->buf[0] == 'q') {
               cl->state = SCS_MENU;
               seq = SCSP_INIT;
             }
@@ -1183,11 +1182,18 @@ void clients_handle_state(int id)
               if (prop <= 0 || prop > (long)VAR_LAST) {
                 cl->connection.printf("invalid property: %s\r\n", ctx->buf);
                 seq = SCSP_INIT;
+              } else if (prop == 1) {
+                cl->connection.println("resetting configuration");
+                eeprom_wipe();
+                delay(200);
+                cl->connection.stop();
+                ESP.restart();
               } else {
                 ctx->var = eeprom_typemap[prop].var;
                 seq = SCSP_RECV_VAL;
                 ctx->buflen = 0;
                 cl->connection.printf("enter new %s: ",
+                                      ctx->var == VAR_USERNAME ? "username" : 
                                       eeprom_typemap[ctx->var].varname);
               }
             }
@@ -1252,7 +1258,16 @@ void clients_handle_state(int id)
               }
             }
 
-            seq = SCSP_INIT;
+            if (ctx->var == VAR_USERNAME) {
+              /* update password after username */
+              ctx->var    = VAR_PASSWORD;
+              seq         = SCSP_RECV_VAL;
+              ctx->buflen = 0;
+              cl->connection.printf("enter new %s: ",
+                                    eeprom_typemap[ctx->var].varname);
+            } else {
+              seq = SCSP_INIT;
+            }
             break;
         }
         cl->seq = (int)seq;
@@ -1374,8 +1389,9 @@ void net_handle_event(WiFiEvent_t event) {
 /* {{{ Arduino setup function
  * called once during startup */
 void setup() {
-  char eeprom_magic[4];
-  bool initeeprom = false;
+  char     eeprom_magic[4];
+  bool     initeeprom = false;
+  uint32_t baudrate;
 
   Serial.begin(115200);
   EEPROM.begin(EEPROM_SIZE);
@@ -1421,8 +1437,10 @@ void setup() {
     ESP.restart();
   }
 
-  Serial.println("Setting up serial connection: 115200 baud");
-  Serial1.begin(115200, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN, true);
+  host_powered_on = digitalRead(BOARD_PWR_PIN) == HIGH ? true : false;
+  baudrate = eeprom_get_var_int(host_powered_on ? VAR_BAUD_ON : VAR_BAUD_OFF);
+  Serial.printf("Setting up COM1 serial connection: %u baud\r\n", baudrate);
+  Serial1.begin(baudrate, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN, true);
 
   Serial.println("Setting up power and reset pins for output");
   pinMode(POWER_PIN, OUTPUT);
@@ -1444,6 +1462,7 @@ void loop() {
   size_t savail;
   WiFiClient newclient;
   static int laststate = digitalRead(ESP_BUT1_PIN);
+  static bool lasthostpoweron = host_powered_on;
 
   if (digitalRead(ESP_BUT1_PIN) != laststate) {
     Serial.println("Reset button BUT1 pressed, performing EEPROM wipe");
@@ -1454,6 +1473,27 @@ void loop() {
 
   if (!server_ready)
     return;
+
+  /* track power, and handle state changes */
+  host_powered_on = digitalRead(BOARD_PWR_PIN) == HIGH ? true : false;
+  if (host_powered_on != lasthostpoweron) {
+    char  *msg;
+    size_t msgsiz;
+    if (host_powered_on) {
+      msg    = (char *)"[host powered on]\n";
+      msgsiz = 18;
+      Serial1.begin(eeprom_get_var_int(VAR_BAUD_ON),
+                    SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN, true);
+    } else {
+      msg    = (char *)"[host powered off]\n";
+      msgsiz = 19;
+      Serial1.begin(eeprom_get_var_int(VAR_BAUD_OFF),
+                    SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN, true);
+    }
+    clients_console_write_bytes(msg, msgsiz, -1);
+    clients_history_write_bytes(msg, msgsiz);
+  }
+  lasthostpoweron = host_powered_on;
 
   /* add new connections, if any */
   if (telnet.hasClient()) {
