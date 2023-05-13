@@ -989,7 +989,8 @@ void clients_handle_state(int id)
           case SCSM_INIT:
             memset(ctx, 0, sizeof(*ctx));
             seq = SCSM_SEND_MAIN;
-            cl->connection.printf("SMILO  %-51s  [%s]\r\n",
+            cl->connection.printf("SMILO %-12s  %-38s  [%s]\r\n",
+                                  GIT_VERSION,
                                   eeprom_get_var_str(VAR_HOSTNAME),
                                   ETH.macAddress().c_str());
             break;
