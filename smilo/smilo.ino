@@ -1452,7 +1452,7 @@ void loop() {
   }
 
   if (!server_ready)
-    goto snooze;
+    return;
 
   /* add new connections, if any */
   if (telnet.hasClient()) {
@@ -1541,14 +1541,6 @@ void loop() {
   }
 
   http.handleClient();
-
-  /* trigger re-iteration so existing connections remain responsive */
-  if (connected_clients > 0 || savail > 0)
-    return;
-
-snooze:
-  delay(1000 + (rand() % 250));
-  return;
 }
 /* }}} */
 
