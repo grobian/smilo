@@ -416,7 +416,7 @@ eeprom_set_var(eeprom_var var, const void *val)
         }
 
         if (writedata || valkind == var) {
-          EEPROM.writeByte(waddr, valtype);
+          EEPROM.writeByte(waddr, valtype << 5 | valkind);
           EEPROM.writeUInt(waddr, len);
         }
         waddr += 1 + 4;
