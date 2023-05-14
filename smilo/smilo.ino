@@ -411,15 +411,18 @@ eeprom_set_var(eeprom_var var, const void *val)
 
         if (valkind == var) {
           /* fixed-width types can be updated in-place */
-          len = (unsigned int)val;
+          len = (uint32_t)val;
           addvalue = false;
         }
 
         if (writedata || valkind == var) {
           EEPROM.writeByte(waddr, valtype << 5 | valkind);
+          waddr++;
           EEPROM.writeUInt(waddr, len);
+          waddr += 4;
+        } else {
+          waddr += 1 + 4;
         }
-        waddr += 1 + 4;
         break;
       default:
         /* ignore this value, we don't know how to handle it,
