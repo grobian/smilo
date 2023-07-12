@@ -37,12 +37,6 @@
 
 /* TODO:
  * - the web-interface needs a lot of love
- * - console output on web-interface needs processing for ANSI-escape
- *   codes and more not to show gibberish
- * - the history buffer resume should probably recognise screen clears
- *   or the alternative buffer call and reset the buffer for that
- *   (connect can show quite some past behaviour)
- *   handle erase in display, \033 [ (0|1|2|3|) J
  * - respond to the USB serial connection, allow things like rebooting,
  *   config reset
  */
@@ -574,14 +568,105 @@ void http_handle_config_reset() {
   ESP.restart();
 }
 
+/* strip unwanted control chars and ANSI escapes from output suitable
+ * for HTML
+ * this function handles the history buffer wrap */
+size_t http_strip_ansi_escape(char  *dest,
+                              size_t destsiz,
+                              size_t pos,
+                              size_t len)
+{
+  size_t retlen = 0;
+  size_t i;
+  char   p;
+  enum state {
+    S_NORM = 0,
+    S_ESC,
+    S_BRACL,
+    S_ARG,
+    S_BRACR,
+    S_TITLE
+  }      curstate = S_NORM;
+
+  /* the idea is that we just copy byte by byte scanning forwards,
+   * skipping over the input when we detect an ANSI escape of some sort
+   * perhaps less efficient, but we keep a state such that we can
+   * evaluate byte by byte, and wrap around the buffer edges easily
+   * we don't validate here, the idea is that we assume the input is
+   * valid, that is, if we get confused, we kick back to emitting the
+   * initial processing state, outputting whatever garbage there
+   * currently is
+   * ANSI codes:
+   * https://gist.github.com/fnky/458719343aabd01cfb17a3a4f7296797 */
+
+  for (i = 0; i < len; i++) {
+    p = (char)histbuf[(pos + i) % histbuflen];
+    switch (curstate) {
+      case S_NORM:
+        if (p == '\033') {
+          curstate = S_ESC;
+          break;
+        }
+        /* skip unprintable chars */
+        if (p < ' ' && p != '\n' && p != '\t')
+          break;
+        if (p >= 127)
+          break;
+
+        if (retlen == destsiz)
+          return retlen;
+        dest[retlen++] = p;
+        break;
+      case S_ESC:
+        if (p == '[') {
+          curstate = S_BRACL;
+          break;
+        } else if (p == ']') {
+          curstate = S_BRACR;
+          break;
+        } else {
+          curstate = S_NORM;
+          i--;  /* re-evaluate */
+          break;
+        }
+        break;
+      case S_BRACL:
+        curstate = S_ARG;
+        if (p == '=' || p == '?')
+          break;
+        /* fall-through: this is an argument now */
+      case S_ARG:
+        if (p >= '0' && p <= '9')
+          break;
+        if (p == ';')
+          break;
+        /* any letter (non-number or semi-colon) means end of this
+         * directive */
+        curstate = S_NORM;
+        break;
+      case S_BRACR:
+        curstate = S_TITLE;
+        /* fall-through: find the title end */
+      case S_TITLE:
+        if (p == '\007')
+          curstate = S_NORM;
+        break;
+    }
+  }
+
+  return retlen;
+}
+
 void http_handle_root() {
-  static char *hostname = strdup(eeprom_get_var_str(VAR_HOSTNAME));
-  size_t drlen = sizeof(histbuf) + 1024;
-  char *dataresponse;
+  static char *hostname     = strdup(eeprom_get_var_str(VAR_HOSTNAME));
+  size_t       drlen        = sizeof(histbuf) + 1024;
+  static char *dataresponse = (char *)malloc(drlen);
+  size_t       pos;
+  size_t       remain;
+  size_t       bpos;
 
   http_prologue();
 
-  dataresponse = (char *)malloc(drlen);
   if (dataresponse == NULL) {
     /* TODO: should we be more forgiving and try without current
      * console buffer?  Questionable if it should help, histbuf
@@ -591,7 +676,7 @@ void http_handle_root() {
     return;
   }
 
-  snprintf(dataresponse, drlen,
+  bpos = snprintf(dataresponse, drlen,
            "<html><head><title>SMiLO - %s</title></head>"
            "<body><h1>SMiLO - %s</h1>"
            "<p>MAC: %s</p>"
@@ -602,13 +687,23 @@ void http_handle_root() {
            "<li><a href='/conf/reset'>reset configuration to defaults</a></li>"
            "</ul>"
            "<h2>console</h2>"
-           "<div style='background-color:LightGray;'><pre>%.*s%.*s</pre></div>"
-           "</body>"
-           "</html>",
+           "<div style='background-color:LightGray;'><pre>",
            hostname, hostname,
-           ETH.macAddress().c_str(),
-           (int)(histbuflen - histbufpos), &histbuf[histbufpos],
-           (int)histbufpos, histbuf);
+           ETH.macAddress().c_str());
+
+  pos    = clients_history_find_last_screen();
+  if (pos < histbufpos)
+    remain = histbufpos - pos;
+  else
+    remain = histbuflen - (pos - histbufpos);
+
+  bpos += http_strip_ansi_escape(dataresponse + bpos,
+                                 drlen - bpos,
+                                 pos, remain);
+  bpos += snprintf(dataresponse + bpos, drlen - bpos,
+           "</pre></div>"
+           "</body>"
+           "</html>");
 
   http.send(200, "text/html", dataresponse);
   free(dataresponse);
@@ -771,6 +866,108 @@ void clients_history_write_bytes(char *s, size_t len)
     if (histbuflen < histbufpos)
       histbuflen = histbufpos;
   } while (len > 0);
+}
+
+/* return position (or start of buffer) after the last clearscreen */
+size_t clients_history_find_last_screen(void)
+{
+  char  *p;
+  char   storebuf[8] = { '\0', '\0', '\0', '\0',  '\0', '\0', '\0', '\0' };
+  size_t i;
+  size_t clen;
+
+  /* currently, we only search for clrscrn, alternate screen and restore:
+   * \033 [ (0|1|2|3)? J   3 or 4 bytes
+   * \033 [ ? 1049 (h|l)   8 bytes
+   * \033 [ ? 47 l         6 bytes
+   * the strategy is complex in favour of returning as fast as possible
+   * by searching backwards */
+
+  /* shortcut empty/early buffer case */
+  if (histbuflen < 3)
+    return 0;
+
+  /* match codes in BUF, at POS, where POS >= 8, checks ESC first, since
+   * it should happen less often than things like J, l, h */
+#define _match_code(BUF,POS) \
+  ( \
+    ( \
+      BUF[POS - 3] == '\003' && BUF[POS - 2] == '[' && \
+      BUF[POS - 1] >= '0'    && BUF[POS - 1] <= '3' && \
+      BUF[POS]     == 'J' \
+    ) \
+    || \
+    ( \
+      BUF[POS - 2] == '\033' && BUF[POS - 1] == '[' && \
+      BUF[POS]     == 'J' \
+    ) \
+    || \
+    ( \
+      BUF[POS - 7] == '\033' && BUF[POS - 6] == '[' && \
+      BUF[POS - 5] == '?'    && BUF[POS - 4] == '1' && \
+      BUF[POS - 3] == '0'    && BUF[POS - 2] == '4' && \
+      BUF[POS - 1] == '9'    && \
+      ( \
+        BUF[POS] == 'h' || BUF[POS] == 'l' \
+      ) \
+    ) \
+    || \
+    ( \
+      BUF[POS - 5] == '\033' && BUF[POS - 4] == '[' && \
+      BUF[POS - 3] == '?'    && BUF[POS - 2] == '4' && \
+      BUF[POS - 1] == '7'    && BUF[POS]     == 'l' \
+    ) \
+  )
+#define match_code(BUF,POS) _match_code(((char *)(BUF)), (POS))
+
+  /* walk through the buffer, ensure there's always 8-byte room for the
+   * macro check, therefore, on the tail and edges of the wrap use
+   * storebuf to provide the space to the macro */
+
+  /* phase one: the easy bit, scan whatever's there until the front of
+   * the buffer */
+  for (i = histbufpos; i >= 8; i--)
+    if (match_code(histbuf, i - 1))
+      return i;
+
+  /* phase two: scan the remainder of the front of the buffer, either
+   * with data from the tail (wrap), or zeros when there is none */
+  if (histbuflen > histbufpos) {
+    for (i = 8; i >= 3; i--) {
+      clen = 8 - (i - 1);
+      memcpy(&storebuf[clen], histbuf, i - 1);
+      memcpy(storebuf, &histbuf[histbuflen - clen], clen);
+      if (match_code(storebuf, 7))
+        return i;
+    }
+  } else {
+    for (i = 8; i >= 3; i--) {
+      clen = 8 - (i - 1);
+      memcpy(&storebuf[clen], histbuf, i - 1);
+      memset(storebuf, 0, clen);
+      if (match_code(storebuf, 7))
+        return i;
+    }
+  }
+
+  /* phase three: scan from the end of the buffer to the current
+   * position */
+  for (i = histbuflen; i > histbufpos + 8; i--)
+    if (match_code(histbuf, i - 1))
+      return i;
+
+  /* phase four: scan the remainder to the position, not taking into
+   * account unrelated bytes at the other side of the marker */
+  for (i = 8; i >= 3; i--) {
+    clen = 8 - (i - 1);
+    memcpy(&storebuf[clen], &histbuf[histbufpos], i - 1);
+    memset(storebuf, 0, clen);
+    if (match_code(storebuf, 7))
+      return histbufpos + i;
+  }
+
+  /* nothing found, return start of the buffer */
+  return histbufpos;
 }
 
 static uint8_t telnet_read(int id)
@@ -1284,11 +1481,21 @@ void clients_handle_state(int id)
         client_sol_state seq = (client_sol_state)cl->seq;
         switch (seq) {
           case SCSS_INIT:
-            /* dump current history buffer */
-            clients_console_write_bytes((char *)&histbuf[histbufpos],
-                                        histbuflen - histbufpos, id);
-            clients_console_write_bytes((char *)histbuf, histbufpos, id);
-            cl->seq = (int)SCSS_SOL;
+            {
+              size_t pos;
+
+              cl->seq = (int)SCSS_SOL;
+
+              pos = clients_history_find_last_screen();
+              if (pos >= histbufpos) {
+                clients_console_write_bytes((char *)&histbuf[pos],
+                                            histbuflen - pos, id);
+                clients_console_write_bytes((char *)histbuf, histbufpos, id);
+              } else {
+                clients_console_write_bytes((char *)&histbuf[pos],
+                                            histbufpos - pos, id);
+              }
+            }
             break;
           case SCSS_SOL:
             {
