@@ -706,7 +706,6 @@ void http_handle_root() {
            "</html>");
 
   http.send(200, "text/html", dataresponse);
-  free(dataresponse);
 }
 /* }}} */
 
