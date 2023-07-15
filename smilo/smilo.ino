@@ -600,6 +600,8 @@ size_t http_strip_ansi_escape(char  *dest,
    * https://gist.github.com/fnky/458719343aabd01cfb17a3a4f7296797 */
 
   for (i = 0; i < len; i++) {
+    if (retlen == destsiz)
+      return retlen;
     p = (char)histbuf[(pos + i) % histbuflen];
     switch (curstate) {
       case S_NORM:
@@ -613,8 +615,6 @@ size_t http_strip_ansi_escape(char  *dest,
         if (p >= 127)
           break;
 
-        if (retlen == destsiz)
-          return retlen;
         dest[retlen++] = p;
         break;
       case S_ESC:
@@ -641,7 +641,17 @@ size_t http_strip_ansi_escape(char  *dest,
         if (p == ';')
           break;
         /* any letter (non-number or semi-colon) means end of this
-         * directive */
+         * directive, check if we have to map this directive into
+         * something else */
+        switch (p) {
+          case 'H':
+          case 'f':
+          case 'E':
+          case 'F':
+          case 'J':
+            dest[retlen++] = '\n';
+            break;
+        }
         curstate = S_NORM;
         break;
       case S_BRACR:
@@ -879,6 +889,7 @@ size_t clients_history_find_last_screen(void)
    * \033 [ (0|1|2|3)? J   3 or 4 bytes
    * \033 [ ? 1049 (h|l)   8 bytes
    * \033 [ ? 47 l         6 bytes
+   * \033 [ H              3 bytes
    * the strategy is complex in favour of returning as fast as possible
    * by searching backwards */
 
@@ -899,6 +910,11 @@ size_t clients_history_find_last_screen(void)
     ( \
       BUF[POS - 2] == '\033' && BUF[POS - 1] == '[' && \
       BUF[POS]     == 'J' \
+    ) \
+    || \
+    ( \
+      BUF[POS - 2] == '\033' && BUF[POS - 1] == '[' && \
+      BUF[POS]     == 'H' \
     ) \
     || \
     ( \
