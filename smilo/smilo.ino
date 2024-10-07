@@ -229,14 +229,16 @@ typedef enum eeprom_var {
   VAR_CYCLEMS,
   VAR_HOLDMS,
   VAR_BAUD_ON,
-  VAR_BAUD_OFF
+  VAR_BAUD_OFF,
+  VAR_INVERT
 #define VAR_FIRST VAR_PASSWORD
-#define VAR_LAST  VAR_BAUD_OFF
+#define VAR_LAST  VAR_INVERT
 } eeprom_var;
 
 typedef enum eeprom_type {
   VARTPE_STR   = 1,   /* 4-byte int + bytes */
-  VARTPE_INT   = 2    /* 4-byte int */
+  VARTPE_INT   = 2,   /* 4-byte int */
+  VARTPE_BOL   = 3,   /* 1-byte int */
 } eeprom_vartype;
 
 static struct {
@@ -252,7 +254,8 @@ static struct {
   { VAR_CYCLEMS,  "press time ms",          VARTPE_INT, (void *)200     },
   { VAR_HOLDMS,   "hold time ms",           VARTPE_INT, (void *)5000    },
   { VAR_BAUD_ON,  "COM1 baudrate host on",  VARTPE_INT, (void *)115200  },
-  { VAR_BAUD_OFF, "COM1 baudrate host off", VARTPE_INT, (void *)50      }
+  { VAR_BAUD_OFF, "COM1 baudrate host off", VARTPE_INT, (void *)50      },
+  { VAR_INVERT,   "COM1 invert mode",       VARTPE_BOL, (void *)1       }
 #define MAX_DEFVAL_SIZE  6
 #define MAX_VARNAME_SIZE 22
 };
@@ -323,6 +326,12 @@ eeprom_get_var(eeprom_var var)
         }
         addr += 4;
         break;
+      case VARTPE_BOL:
+        if (valkind == (uint32_t)var) {
+          retval = (void *)(size_t)EEPROM.readByte(addr);
+        }
+        addr++;
+        break;
       default:
         /* ignore this value, we don't know how to handle it */
         retval = NULL;
@@ -337,8 +346,9 @@ eeprom_get_var(eeprom_var var)
     retval = eeprom_typemap[var].defval;
   return retval;
 }
-#define eeprom_get_var_int(VAR)  (uint32_t)eeprom_get_var(VAR)
 #define eeprom_get_var_str(VAR)  (char *)eeprom_get_var(VAR)
+#define eeprom_get_var_int(VAR)  (uint32_t)eeprom_get_var(VAR)
+#define eeprom_get_var_bol(VAR)  (bool)eeprom_get_var(VAR)
 
 void
 eeprom_set_var(eeprom_var var, const void *val)
@@ -418,6 +428,25 @@ eeprom_set_var(eeprom_var var, const void *val)
           waddr += 1 + 4;
         }
         break;
+      case VARTPE_BOL:
+        len = EEPROM.readByte(raddr);
+        raddr++;
+
+        if (valkind == var) {
+          /* like int, do in-place */
+          len = (uint32_t)val;
+          addvalue = false;
+        }
+
+        if (writedata || valkind == var) {
+          EEPROM.writeByte(waddr, valtype << 5 | valkind);
+          waddr++;
+          EEPROM.writeByte(waddr, (uint8_t)len);
+          waddr++;
+        } else {
+          waddr += 1 + 1;
+        }
+        break;
       default:
         /* ignore this value, we don't know how to handle it,
          * effectively skip it */
@@ -442,6 +471,10 @@ eeprom_set_var(eeprom_var var, const void *val)
         EEPROM.writeUInt(waddr, (unsigned int)val);
         waddr += 4;
         break;
+      case VARTPE_BOL:
+        EEPROM.writeByte(waddr, (uint8_t)(size_t)val);
+        waddr++;
+        break;
     }
 
     writedata = true;
@@ -454,8 +487,9 @@ eeprom_set_var(eeprom_var var, const void *val)
   EEPROM.commit();
 }
 /* arduino doesn't seem to have ptr_t, use size_t instead */
-#define eeprom_set_var_int(VAR,VAL)  eeprom_set_var(VAR,(void *)(size_t)VAL)
 #define eeprom_set_var_str(VAR,VAL)  eeprom_set_var(VAR,(void *)VAL)
+#define eeprom_set_var_int(VAR,VAL)  eeprom_set_var(VAR,(void *)(size_t)VAL)
+#define eeprom_set_var_bol(VAR,VAL)  eeprom_set_var(VAR,(void *)(size_t)VAL)
 /* }}} */
 
 /* {{{ HTTP */
@@ -1372,6 +1406,16 @@ void clients_handle_state(int id)
                                        eeprom_get_var_int((eeprom_var)i),
                                        MAX_DEFVAL_SIZE,
                                        (uint32_t)eeprom_typemap[i].defval);
+                } else if (eeprom_typemap[i].type == VARTPE_BOL) {
+                  cl->connection.printf("%2d. %*s  %*s  [%*s]\r\n",
+                                       i, -1 * MAX_VARNAME_SIZE,
+                                       eeprom_typemap[i].varname,
+                                       -1 * MAX_VAL_SIZE,
+                                       eeprom_get_var_bol((eeprom_var)i) ?
+                                       "true" : "false",
+                                       MAX_DEFVAL_SIZE,
+                                       (bool)eeprom_typemap[i].defval ?
+                                       "true" : "false");
                 }
               }
               cl->connection.printf(" q. return to main menu\r\n"
@@ -1455,10 +1499,12 @@ void clients_handle_state(int id)
               ctx->buf[ctx->buflen] = '\0';
 
               if (eeprom_typemap[ctx->var].type == VARTPE_INT) {
-                int val = (int)strtol(ctx->buf, NULL, 10);
+                int val;
                 if (ctx->buflen == 0) {
                   val = (int)(eeprom_typemap[ctx->var].defval);
                   cl->connection.printf("setting default value %ld\n", val);
+                } else {
+                  val = (int)strtol(ctx->buf, NULL, 10);
                 }
                 eeprom_set_var_int(ctx->var, val);
               } else if (eeprom_typemap[ctx->var].type == VARTPE_STR) {
@@ -1472,6 +1518,14 @@ void clients_handle_state(int id)
                 {
                   eeprom_set_var_str(ctx->var, ctx->buf);
                 }
+              } else if (eeprom_typemap[ctx->var].type == VARTPE_BOL) {
+                bool val;
+                if (ctx->buflen == 0) {
+                  val = (bool)(eeprom_typemap[ctx->var].defval);
+                  cl->connection.printf("setting default value %s\n",
+                                        val ? "true" : "false");
+                }
+                eeprom_set_var_bol(ctx->var, val);
               }
             }
 
@@ -1619,6 +1673,7 @@ void setup() {
   char     eeprom_magic[4];
   bool     initeeprom = false;
   uint32_t baudrate;
+  bool     invert;
 
   Serial.begin(115200);
   EEPROM.begin(EEPROM_SIZE);
@@ -1666,8 +1721,9 @@ void setup() {
 
   host_powered_on = digitalRead(BOARD_PWR_PIN) == HIGH ? true : false;
   baudrate = eeprom_get_var_int(host_powered_on ? VAR_BAUD_ON : VAR_BAUD_OFF);
+  invert = eeprom_get_var_bol(VAR_INVERT);
   Serial.printf("Setting up COM1 serial connection: %u baud\r\n", baudrate);
-  Serial1.begin(baudrate, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN, true);
+  Serial1.begin(baudrate, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN, invert);
 
   Serial.println("Setting up power and reset pins for output");
   pinMode(POWER_PIN, OUTPUT);
