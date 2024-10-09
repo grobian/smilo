@@ -289,7 +289,10 @@ eeprom_get_var(eeprom_var var)
   uint32_t    valkind;
   uint32_t    strvallen;
   uint32_t    len;
-  const void *retval    = NULL;
+  const void *retval;
+
+  /* return default if not overridden */
+  retval = eeprom_typemap[var].defval;
 
   /* walk through EEPROM space for as long as we don't find the sentinel
    * or the end of EEPROM space */
@@ -322,14 +325,13 @@ eeprom_get_var(eeprom_var var)
       case VARTPE_INT:
         if (valkind == (uint32_t)var) {
           len = EEPROM.readUInt(addr);
-          retval = (void *)len;
+          retval = (void *)(size_t)len;
         }
         addr += 4;
         break;
       case VARTPE_BOL:
-        if (valkind == (uint32_t)var) {
+        if (valkind == (uint32_t)var)
           retval = (void *)(size_t)EEPROM.readByte(addr);
-        }
         addr++;
         break;
       default:
@@ -342,8 +344,6 @@ eeprom_get_var(eeprom_var var)
       break;
   }
 
-  if (retval == NULL)
-    retval = eeprom_typemap[var].defval;
   return retval;
 }
 #define eeprom_get_var_str(VAR)  (char *)eeprom_get_var(VAR)
@@ -415,7 +415,7 @@ eeprom_set_var(eeprom_var var, const void *val)
 
         if (valkind == var) {
           /* fixed-width types can be updated in-place */
-          len = (uint32_t)val;
+          len = (uint32_t)(size_t)val;
           addvalue = false;
         }
 
@@ -434,7 +434,7 @@ eeprom_set_var(eeprom_var var, const void *val)
 
         if (valkind == var) {
           /* like int, do in-place */
-          len = (uint32_t)val;
+          len = (uint32_t)(size_t)val;
           addvalue = false;
         }
 
@@ -468,7 +468,7 @@ eeprom_set_var(eeprom_var var, const void *val)
         waddr += strvallen;
         break;
       case VARTPE_INT:
-        EEPROM.writeUInt(waddr, (unsigned int)val);
+        EEPROM.writeUInt(waddr, (unsigned int)(size_t)val);
         waddr += 4;
         break;
       case VARTPE_BOL:
