@@ -1513,14 +1513,32 @@ void clients_handle_state(int id)
                                         eeprom_typemap[ctx->var].defval);
                   eeprom_set_var(ctx->var,
                                  eeprom_typemap[ctx->var].defval);
-                }
-                else
-                {
+                } else {
                   eeprom_set_var_str(ctx->var, ctx->buf);
                 }
               } else if (eeprom_typemap[ctx->var].type == VARTPE_BOL) {
                 bool val;
-                if (ctx->buflen == 0) {
+                bool set = false;
+                if (ctx->buflen != 0) {
+                  if (strcmp(ctx->buf, "true") == 0 ||
+                      strcmp(ctx->buf, "yes") == 0 ||
+                      strcmp(ctx->buf, "t") == 0 ||
+                      strcmp(ctx->buf, "y") == 0 ||
+                      strcmp(ctx->buf, "1") == 0)
+                  {
+                    val = true;
+                    set = true;
+                  } else if (strcmp(ctx->buf, "false") == 0 ||
+                             strcmp(ctx->buf, "no") == 0 ||
+                             strcmp(ctx->buf, "f") == 0 ||
+                             strcmp(ctx->buf, "n") == 0 ||
+                             strcmp(ctx->buf, "0") == 0)
+                  {
+                    val = false;
+                    set = true;
+                  }
+                }
+                if (!set) {
                   val = (bool)(eeprom_typemap[ctx->var].defval);
                   cl->connection.printf("setting default value %s\n",
                                         val ? "true" : "false");
